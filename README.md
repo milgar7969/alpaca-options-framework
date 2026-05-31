@@ -170,6 +170,35 @@ BULL / BEAR / NEUTRAL direction is derived by combining all five — see `moment
 
 ---
 
+## WebSocket vs REST — Why Both
+
+A common question: why use WebSocket streaming for quotes instead of REST polling?
+
+**The bot uses both — for different purposes:**
+
+| Operation | Method | Reason |
+|---|---|---|
+| Real-time SPY 1-min bars | WebSocket (StockDataStream) | Pushed at bar close, zero polling overhead |
+| Real-time option quotes | WebSocket (OptionDataStream) | Every quote tick, sub-10ms delivery |
+| Order fill events | WebSocket (TradingStream) | Instant fill confirmation |
+| Historical bars at startup | REST | One-shot fetch, no need for streaming |
+| 5-day ATR baseline | REST | One-shot fetch at startup |
+| Submit entry order | REST | `submit_order()` — synchronous, want confirmation |
+| Close position | REST | `close_position()` — only working exit method |
+| Recover open positions on restart | REST | `get_all_positions()` — definitive server state |
+
+**Why not REST polling for option quotes?**
+
+The bot subscribes to 42 option symbols simultaneously (21 calls + 21 puts). Polling all 42 every second = 42 REST requests/second. Alpaca's free tier allows ~200 requests/minute — you'd hit the rate limit in under 5 seconds.
+
+Even if rate limits weren't an issue, REST polling introduces latency on every request (50–200ms per HTTP round trip). For 0DTE entries where you're trying to catch a move in progress, a WebSocket that pushes quotes as they happen is significantly more responsive.
+
+There's also a data completeness issue: if an option spikes and reverses within a 1-second polling window, REST never sees the peak. WebSocket delivers every tick — the spike would update `peak_mid` and potentially arm the trailing stop. With REST polling, that recovery is invisible.
+
+**Rule of thumb:** use WebSocket for anything that changes multiple times per second. Use REST for one-shot queries and order submission.
+
+---
+
 ## Requirements
 
 - Python 3.9+
