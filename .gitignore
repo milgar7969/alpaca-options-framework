@@ -1,0 +1,18 @@
+# Credentials — never commit
+.env
+*.env
+
+# Logs and trade data
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# macOS
+.DS_Store

@@ -1,0 +1,5 @@
+# Runtime
+alpaca-py>=0.43.0
+
+# Python 3.9+ required (uses zoneinfo, stdlib from 3.9+)
+# All other dependencies (asyncio, csv, datetime, logging, etc.) are stdlib.
