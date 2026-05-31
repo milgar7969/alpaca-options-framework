@@ -23,40 +23,76 @@ TIME_STOP         = "15:25"  # ET — force-close all positions
 OPTION_MIN_PRICE  = 0.20   # min price — filters deeply OTM lottery tickets
 OPTION_MAX_PRICE  = 10.00  # max price
 
-# Momentum thresholds
-MIN_CONSEC_BARS   = 3      # consecutive green (or red) 1-min bars required
-ROC_THRESHOLD     = 0.0003 # 5-bar rate-of-change minimum
-ATR5_MIN_ENTRY    = 0.20   # min 5-bar ATR at entry — blocks low-vol theta-bleed setups
+# ── Momentum thresholds — calibrate for your strategy ─────────────────────────
+# These values drive the BULL/BEAR signal in momentum.py.
+# Start conservative and loosen based on your live session data.
+# Calibrated values are included in the full strategy package.
+MIN_CONSEC_BARS   = None   # int: consecutive green/red bars required (e.g. 2–4)
+ROC_THRESHOLD     = None   # float: 5-bar ROC minimum (e.g. 0.0002–0.0005)
+ATR5_MIN_ENTRY    = None   # float: min intrabar velocity gate (e.g. 0.15–0.25)
 
-# Strike proximity zones
-ACTIVATION_PCT    = 0.003  # within 0.3% of strike → "activation" zone (~$2.20 at SPY $740)
-APPROACH_PCT      = 0.007  # within 0.7% → "approach" zone (~$5.20 at SPY $740)
+# ── Strike proximity zones — calibrate for your strategy ──────────────────────
+# How close to the strike SPY must be before an entry is considered.
+# Tighter = fewer but higher-quality entries.
+# Calibrated values are included in the full strategy package.
+ACTIVATION_PCT    = None   # float: "activation" zone radius as % of SPY price
+APPROACH_PCT      = None   # float: "approach" zone radius (wider outer band)
 
-# Proxy delta — disabled: delta only updates on 1-min bar ticks so stays 0 between
-# bars and blocks all entries. Momentum + zone filters are sufficient gatekeepers.
-PROXY_DELTA_MIN   = 0.0    # 0.0 = disabled (was 0.03)
+# ── Proxy delta (disabled by default) ─────────────────────────────────────────
+# Delta only updates on 1-min bar ticks so stays 0 between bars.
+# Set PROXY_DELTA_MIN = 0.0 to disable entirely.
+PROXY_DELTA_MIN      = 0.0
 REQUIRE_DELTA_RISING = False
 
 # ── Risk & sizing ──────────────────────────────────────────────────────────────
-MAX_RISK_PER_TRADE = 150.00   # dollars at risk per trade (stop loss basis)
-MAX_DAILY_LOSS     = 300.00   # hard daily loss limit — bot shuts down entries
-MAX_TRADES_PER_DAY = 999      # effectively unlimited during paper/data collection
-TRADE_COOLDOWN_BARS = 3       # 1-min bars to wait after a trade closes before re-entering
+MAX_RISK_PER_TRADE  = 150.00  # dollars at risk per trade (stop loss basis)
+MAX_DAILY_LOSS      = 300.00  # hard daily loss limit — bot stops new entries
+MAX_TRADES_PER_DAY  = 999     # effectively unlimited; lower for live trading
+TRADE_COOLDOWN_BARS = 3       # bars to wait after any close before re-entering
 
-# ── Bracket order exit levels ──────────────────────────────────────────────────
-STOP_MULT          = 0.50   # hard stop:          exit if price falls to 50% of entry
-TP_MULT            = 1.50   # take-profit:        exit at 50% gain (1.5× entry)
+# ── Exit levels — calibrate for your strategy ─────────────────────────────────
+# These multipliers apply to the entry fill price.
+# Standard starting points: stop=0.50, tp=1.50 — adjust based on your W/L ratio.
+# Calibrated values are included in the full strategy package.
+STOP_MULT          = None   # float: hard stop (e.g. 0.40–0.60)
+TP_MULT            = None   # float: take profit (e.g. 1.40–2.00)
 
-# Peak trailing stop — locks in recoveries
-# Activates once the option has gained PEAK_TRAIL_ACTIVATE above entry.
-# From that point, trails at PEAK_TRAIL_PCT × the highest mid seen.
-# Example: entry=$0.96, peak=$1.15 → trail fires at $1.012 (near BE)
-PEAK_TRAIL_ACTIVATE = 1.20  # trail arm: option must reach 20% gain before trail is active
-PEAK_TRAIL_PCT      = 0.88  # trail stop: exit if mid falls to 88% of peak
+# ── Peak trailing stop — calibrate for your strategy ──────────────────────────
+# Arms once the option reaches PEAK_TRAIL_ACTIVATE × entry price.
+# Then trails at PEAK_TRAIL_PCT × the highest mid seen.
+# Threshold must clear normal bid/ask spread noise for cheap options.
+# Calibrated values are included in the full strategy package.
+PEAK_TRAIL_ACTIVATE = None  # float: min gain before trail arms (e.g. 1.10–1.30)
+PEAK_TRAIL_PCT      = None  # float: trail as % of peak (e.g. 0.85–0.92)
+
+# ── Polling ────────────────────────────────────────────────────────────────────
+SNAPSHOT_POLL_SEC  = 30    # how often to poll REST snapshot for proxy-delta calc
 
 # ── Polling ────────────────────────────────────────────────────────────────────
 SNAPSHOT_POLL_SEC  = 30    # how often to poll REST snapshot for proxy-delta calc
 
 # ── Misc ───────────────────────────────────────────────────────────────────────
-ET                 = ZoneInfo("America/New_York")
-LOG_DIR            = "logs"
+ET      = ZoneInfo("America/New_York")
+LOG_DIR = "logs"
+
+# ── Startup validation ─────────────────────────────────────────────────────────
+# Fails immediately if required strategy values are not set.
+_REQUIRED = {
+    "MIN_CONSEC_BARS":    MIN_CONSEC_BARS,
+    "ROC_THRESHOLD":      ROC_THRESHOLD,
+    "ATR5_MIN_ENTRY":     ATR5_MIN_ENTRY,
+    "ACTIVATION_PCT":     ACTIVATION_PCT,
+    "APPROACH_PCT":       APPROACH_PCT,
+    "STOP_MULT":          STOP_MULT,
+    "TP_MULT":            TP_MULT,
+    "PEAK_TRAIL_ACTIVATE":PEAK_TRAIL_ACTIVATE,
+    "PEAK_TRAIL_PCT":     PEAK_TRAIL_PCT,
+}
+_missing = [k for k, v in _REQUIRED.items() if v is None]
+if _missing:
+    raise ValueError(
+        f"\n\nconfig.py: the following strategy parameters are not set:\n"
+        + "\n".join(f"  {k} = None" for k in _missing)
+        + "\n\nImplement your own values, or get the calibrated full strategy package at:\n"
+        + "  https://gumroad.com/milgar7969  [coming soon]\n"
+    )
