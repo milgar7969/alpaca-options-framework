@@ -48,13 +48,17 @@ asyncio.gather(
     feed.start(),               # StockDataStream + OptionDataStream + TradingStream
     _option_subscriber(),       # waits for 9:30 ET bar → subscribes strikes
     _resubscribe_watcher(),     # re-subscribes if SPY moves ±$3
-    _exit_monitor(),            # TP / stop / trail check every 5 seconds
+    _exit_monitor(),            # 30-second safety net (WebSocket reconnect gaps)
     _time_stop_watcher(),       # force-close everything at 3:25 PM ET
     _status_loop(),             # live terminal display
 )
+
+# Quote-driven exits (fires per quote tick, not a gathered task):
+# on_option_quote() → asyncio.create_task(_evaluate_exit(quote))
+# Sub-50ms from quote arrival to order submission.
 ```
 
-Three concurrent WebSocket streams. Entry logic runs in the option quote handler. Exit logic is fully decoupled in its own task — `close_position()` cannot be called safely from inside a stream callback.
+Three concurrent WebSocket streams. Entry logic runs in the quote handler. Exit logic is **quote-driven** — `_evaluate_exit()` fires on every tick for the held symbol via `asyncio.create_task()`, so `close_position()` is never called from inside a stream callback.
 
 ---
 
@@ -131,22 +135,27 @@ The bot waits for 9:30 ET, subscribes options at the actual open price, and beco
 
 ---
 
-## What the Exit Monitor Does (No Strategy Required)
+## How Exits Work (No Strategy Required)
 
-Even with a placeholder `check_entry()`, the exit infrastructure is fully functional. Once you open a position manually or via code, the framework manages it:
+Even with a placeholder `check_entry()`, the exit infrastructure is fully functional. Once a position is open, exits are **quote-driven** — `_evaluate_exit()` fires on every option quote tick for the held symbol via `asyncio.create_task()`. Sub-50ms from quote arrival to order submission.
 
 ```
-Every 5 seconds:
+On every option quote tick for the held symbol:
   1. Update peak_mid (highest option mid seen since entry)
   2. IF mid >= entry × TP_MULT      → close_position() → "tp"
   3. IF mid <= entry × STOP_MULT    → close_position() → "stop"
-  4. IF peak_mid >= entry × 1.20:
-       trail_stop = peak_mid × 0.88
+  4. IF peak_mid >= entry × PEAK_TRAIL_ACTIVATE:
+       trail_stop = peak_mid × PEAK_TRAIL_PCT
        IF mid <= trail_stop         → close_position() → "peak_trail"
 
-At 3:25 PM ET:
+Every 30 seconds (safety net — covers WebSocket reconnect gaps):
+  → re-evaluates the same conditions using the cached quote
+
+At 3:25 PM ET (time stop watcher):
   → close_position() → "time_stop"
 ```
+
+**Race-condition safety:** `exit_pending` is set to `True` before the first `await` in `_evaluate_exit()`. Because asyncio is cooperative (no preemption between synchronous lines), no duplicate exit orders can be submitted even when multiple quote ticks arrive simultaneously.
 
 All exits are logged to `logs/trades_YYYY-MM-DD.csv` with entry price, exit price, quantity, reason, P&L, and timestamps.
 

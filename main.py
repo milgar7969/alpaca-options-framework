@@ -1,20 +1,26 @@
 """
 Entry point — orchestrates the full bot lifecycle.
 
-Simplified flow (bracket-order architecture):
-  1. Startup: fetch ATR baseline, pre-seed EMAs, subscribe to option quotes
+Flow:
+  1. Startup: fetch ATR baseline, pre-seed EMAs, recover open positions
   2. On each 1-min SPY bar:
-       a. Update momentum engine
+       a. Update momentum engine (EMA5/20, VWAP, ROC5, atr5, direction)
        b. Tick risk cooldown
-       c. Poll Alpaca positions → detect if bracket TP/stop fired → record P&L
-       d. Recompute dynamic strikes, update routing table
-       e. Log bar summary
-  3. On each option quote tick:
-       - Update proxy delta tracker
-       - Evaluate entry signal (if no open position)
-       - If entry fires: submit bracket order (entry + TP + stop in one call)
-  4. TIME_STOP at 15:25 ET: force-close any open position via close_position()
-  5. No exit monitoring loop — Alpaca holds the bracket legs.
+       c. Recompute dynamic strikes, update routing table
+       d. Log bar summary
+  3. On each option quote tick (quote-driven exits):
+       - Update quote cache and proxy delta tracker
+       - IF holding this symbol: asyncio.create_task(_evaluate_exit())
+         → sub-50ms response, fires on every tick
+       - ELSE: evaluate entry signal if no open position
+  4. _exit_monitor: 30-second safety net in case quotes stop arriving
+  5. _time_stop_watcher: force-close all positions at 15:25 ET
+
+Exit priority (evaluated in _evaluate_exit on every quote):
+  1. TP       — mid >= entry × TP_MULT (1.50×)
+  2. Stop     — mid <= entry × STOP_MULT (0.50×)
+  3. Trail    — peak_mid >= entry × 1.20 AND mid <= peak_mid × 0.88
+  4. TimeStop — clock >= 15:25 ET (separate watcher)
 """
 
 import asyncio
@@ -178,7 +184,16 @@ async def on_option_quote(quote):
     # Update proxy delta tracker
     bot_state.update_option_quote(sym, bid, ask, ts)
 
-    # Entry only — exits are handled by Alpaca's bracket
+    # Quote-driven exit — fires on every tick for the held symbol.
+    # asyncio.create_task() schedules the coroutine on the event loop and
+    # returns immediately, so close_position() is never called from inside
+    # the stream callback itself.
+    pos = bot_state.position
+    if pos and pos.symbol == sym and not bot_state.exit_pending:
+        asyncio.create_task(_evaluate_exit(bot_state.get_quote(sym)))
+        return
+
+    # Entry evaluation
     if bot_state.position is not None:
         return
     if sym not in _current_subscriptions:
@@ -507,16 +522,78 @@ async def _option_subscriber():
     await asyncio.sleep(float("inf"))
 
 
-# ── Exit monitor (runs every 5 seconds) ───────────────────────────────────────
+# ── Exit evaluation (quote-driven) ────────────────────────────────────────────
+
+async def _evaluate_exit(quote):
+    """
+    Evaluates TP / stop / peak trail on every option quote tick for the
+    held symbol. Called via asyncio.create_task() from on_option_quote,
+    so close_position() never executes inside the stream callback.
+
+    Race-condition safety: exit_pending is set to True before the first
+    await. Because asyncio is cooperative, no other task can run between
+    the exit_pending check and the exit_pending = True assignment — there
+    is no await between those two lines.
+    """
+    pos = bot_state.position
+    if pos is None or bot_state.exit_pending:
+        return
+    if quote is None:
+        return
+
+    mid        = quote.mid
+    tp_price   = pos.entry_price * config.TP_MULT
+    stop_price = pos.entry_price * config.STOP_MULT
+
+    # Update peak mid — monotonically increasing, safe under concurrency
+    if mid > pos.peak_mid:
+        pos.peak_mid = mid
+
+    if mid >= tp_price:
+        reason = "tp"
+    elif mid <= stop_price:
+        reason = "stop"
+    elif pos.peak_mid >= pos.entry_price * config.PEAK_TRAIL_ACTIVATE:
+        trail_stop = pos.peak_mid * config.PEAK_TRAIL_PCT
+        if mid <= trail_stop:
+            logger.info(
+                "PEAK TRAIL: mid=%.2f peak=%.2f trail_stop=%.2f entry=%.2f",
+                mid, pos.peak_mid, trail_stop, pos.entry_price,
+            )
+            reason = "peak_trail"
+        else:
+            return
+    else:
+        return
+
+    # Set exit_pending BEFORE first await — prevents duplicate exit tasks
+    bot_state.exit_pending = True
+    logger.info("EXIT signal: reason=%s mid=%.2f tp=%.2f stop=%.2f",
+                reason, mid, tp_price, stop_price)
+
+    order = await order_manager.close_position(pos.symbol, pos.qty_remaining)
+    fill  = order_manager.get_fill_price(order) if order else mid
+
+    pnl = bot_state.close_position(fill, reason)
+    bot_state.exit_pending = False
+    risk_manager.record_trade(pnl)
+
+    icon = "✅" if pnl >= 0 else "❌"
+    logger.info("%s %s: %s fill=%.2f pnl=$%.2f | daily=$%.2f trades=%d",
+                icon, reason.upper(), pos.symbol, fill,
+                pnl, risk_manager.daily_pnl, risk_manager.trades_today)
+
+
+# ── Exit monitor (30-second safety net) ───────────────────────────────────────
 
 async def _exit_monitor():
     """
-    Checks TP and stop every 5 seconds using the latest option mid price.
-    Uses close_position() — the only exit method that works on Alpaca options.
-    Completely decoupled from the quote handler.
+    Fallback safety net — fires every 30 seconds in case option quotes
+    stop arriving (WebSocket hiccup, reconnect gap). Normal exits are
+    handled quote-driven via _evaluate_exit() called from on_option_quote.
     """
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(30)
 
         pos = bot_state.position
         if pos is None or bot_state.exit_pending:
@@ -526,48 +603,7 @@ async def _exit_monitor():
         if quote is None:
             continue
 
-        mid        = quote.mid
-        tp_price   = pos.entry_price * config.TP_MULT
-        stop_price = pos.entry_price * config.STOP_MULT
-
-        # Update peak mid (used for peak trailing stop)
-        if mid > pos.peak_mid:
-            pos.peak_mid = mid
-
-        # Check TIME_STOP separately (handled by _time_stop_watcher)
-        if mid >= tp_price:
-            reason = "tp"
-        elif mid <= stop_price:
-            reason = "stop"
-        elif pos.peak_mid >= pos.entry_price * config.PEAK_TRAIL_ACTIVATE:
-            # Peak trailing stop — only arms once option has gained PEAK_TRAIL_ACTIVATE
-            trail_stop = pos.peak_mid * config.PEAK_TRAIL_PCT
-            if mid <= trail_stop:
-                logger.info(
-                    "PEAK TRAIL: mid=%.2f peak=%.2f trail_stop=%.2f entry=%.2f",
-                    mid, pos.peak_mid, trail_stop, pos.entry_price,
-                )
-                reason = "peak_trail"
-            else:
-                continue
-        else:
-            continue
-
-        logger.info("EXIT signal: reason=%s mid=%.2f tp=%.2f stop=%.2f",
-                    reason, mid, tp_price, stop_price)
-
-        bot_state.exit_pending = True
-        order = await order_manager.close_position(pos.symbol, pos.qty_remaining)
-        fill  = order_manager.get_fill_price(order) if order else mid
-
-        pnl = bot_state.close_position(fill, reason)
-        bot_state.exit_pending = False
-        risk_manager.record_trade(pnl)
-
-        icon = "✅" if pnl >= 0 else "❌"
-        logger.info("%s %s: %s fill=%.2f pnl=$%.2f | daily=$%.2f trades=%d",
-                    icon, reason.upper(), pos.symbol, fill,
-                    pnl, risk_manager.daily_pnl, risk_manager.trades_today)
+        asyncio.create_task(_evaluate_exit(quote))
 
 
 # ── Task wrapper ───────────────────────────────────────────────────────────────
