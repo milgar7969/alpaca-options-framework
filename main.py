@@ -133,6 +133,8 @@ async def on_spy_bar(bar):
         )
 
     # Update routing table every bar (no WebSocket changes — subscriptions fixed at open)
+    # new_strikes initialised to zero so the BAR log below is always safe pre-market
+    new_strikes = {"call_strike": 0.0, "put_strike": 0.0}
     if _market_open_event.is_set():
         new_strikes = compute_dynamic_strikes(b.close, _baseline_atr)
         new_meta    = _build_routing_table(new_strikes)
@@ -476,13 +478,21 @@ async def _resubscribe_watcher():
             new_symbols.append(held_sym)
             logger.info("Held symbol pinned in subscription: %s", held_sym)
 
-        _feed.add_option_symbols(new_symbols)
-
-        # Update routing table — each symbol keyed to its own actual strike
-        # Held symbol excluded if outside new window (still quoted but won't trigger entries)
+        # Update routing table first (in-memory, always safe)
         _current_subscriptions = _build_routing_table(new_strikes)
+        _last_sub_spy_price    = spy
 
-        _last_sub_spy_price = spy
+        # Attempt WebSocket expansion — wrapped in try/except so a stream
+        # hiccup never kills bar delivery. If this fails, routing table is
+        # already updated so entry logic stays correct for the current window.
+        try:
+            _feed.add_option_symbols(new_symbols)
+            logger.info(
+                "Re-subscribed: call=%.2f put=%.2f | %d symbols total",
+                new_strikes["call_strike"], new_strikes["put_strike"], len(new_symbols),
+            )
+        except Exception as e:
+            logger.warning("Re-subscribe WebSocket call failed (routing table updated): %s", e)
         logger.info(
             "Re-subscribed: call=%.2f put=%.2f | %d symbols total",
             new_strikes["call_strike"], new_strikes["put_strike"], len(new_symbols),
