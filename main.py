@@ -737,7 +737,7 @@ async def main():
     logger.info("Pre-seeding momentum engine...")
     try:
         seed_end   = datetime.datetime.now(tz=config.ET)
-        seed_start = seed_end - datetime.timedelta(days=2)
+        seed_start = seed_end - datetime.timedelta(days=5)  # 5 days covers Mon→Fri lookback
         seed_req   = StockBarsRequest(
             symbol_or_symbols = config.UNDERLYING,
             timeframe         = TimeFrame.Minute,
