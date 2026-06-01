@@ -72,11 +72,6 @@ order_manager   = OrderManager()
 
 _entry_lock: asyncio.Lock = asyncio.Lock()
 
-# Spread spike suppression — when a wide spread is detected on a quote tick,
-# quote-driven exit evaluation is suppressed until the next 1-min bar clears it.
-# The bar handler does one clean exit check at bar close instead.
-_suppress_exit_until_bar: bool = False
-
 # Routing table: {occ_symbol: (side, strike)} — updated every bar
 _current_subscriptions: dict[str, tuple] = {}
 _feed:               FeedManager    = None   # set in main()
@@ -126,20 +121,6 @@ async def on_spy_bar(bar):
 
     # Tick cooldown counter
     risk_manager.tick_bar()
-
-    # Bar-level exit check — runs on every bar close regardless of spread state.
-    # If a spread spike suppressed quote-driven exits, this provides a clean
-    # evaluation at bar close using stable aggregated pricing. Also clears the
-    # suppression flag so quote-driven exits resume for the next bar.
-    global _suppress_exit_until_bar
-    if _suppress_exit_until_bar:
-        logger.debug("Spread spike cleared — resuming quote-driven exits after bar close.")
-        _suppress_exit_until_bar = False
-    pos = bot_state.position
-    if pos and not bot_state.exit_pending:
-        quote = bot_state.get_quote(pos.symbol)
-        if quote:
-            asyncio.create_task(_evaluate_exit(quote))
 
     # Fire market-open event on first RTH bar (≥ 09:30 ET)
     bar_time = b.t.astimezone(config.ET).time()
@@ -211,24 +192,19 @@ async def on_option_quote(quote):
     # the stream callback itself.
     pos = bot_state.position
     if pos and pos.symbol == sym and not bot_state.exit_pending:
-        # Spread filter: if bid/ask spread is abnormally wide, the quote is
-        # unreliable (market-maker pulling quotes, not a real price move).
-        # Suppress quote-driven evaluation until the next 1-min bar closes,
-        # which provides stable aggregated pricing for a clean exit check.
-        global _suppress_exit_until_bar
+        # Spread filter: if bid/ask spread is abnormally wide, this tick's
+        # quote is unreliable (market-maker pulling quotes, not a real move).
+        # Skip this tick only — the next tick re-evaluates immediately.
+        # If spread stays wide, the 30-second safety net covers the fallback.
         if bid > 0 and ask > 0:
             spread_pct = (ask - bid) / ((ask + bid) / 2)
             if spread_pct > 0.25:
-                if not _suppress_exit_until_bar:
-                    logger.debug(
-                        "SPREAD SPIKE %s: bid=%.2f ask=%.2f spread=%.1f%% — "
-                        "exit suppressed until next bar",
-                        sym, bid, ask, spread_pct * 100,
-                    )
-                    _suppress_exit_until_bar = True
-                return
-        if not _suppress_exit_until_bar:
-            asyncio.create_task(_evaluate_exit(bot_state.get_quote(sym)))
+                logger.debug(
+                    "SPREAD SPIKE %s: bid=%.2f ask=%.2f spread=%.1f%% — skip tick",
+                    sym, bid, ask, spread_pct * 100,
+                )
+                return   # skip this tick, next tick re-evaluates fresh
+        asyncio.create_task(_evaluate_exit(bot_state.get_quote(sym)))
         return
 
     # Entry evaluation
