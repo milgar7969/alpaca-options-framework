@@ -72,6 +72,15 @@ order_manager   = OrderManager()
 
 _entry_lock: asyncio.Lock = asyncio.Lock()
 
+# ── Watchdog heartbeat ────────────────────────────────────────────────────────
+# Updated by _status_loop every iteration. Watchdog thread checks every 30s;
+# if stale for > WATCHDOG_TIMEOUT seconds during market hours, auto-restarts.
+import time as _time
+_last_heartbeat:     float = 0.0
+_WATCHDOG_TIMEOUT    = 180   # seconds — restart if event loop silent this long
+_WATCHDOG_START      = "09:00"   # ET — only watch after this time
+_WATCHDOG_END        = "15:35"   # ET — stop watching after this time
+
 # Routing table: {occ_symbol: (side, strike)} — updated every bar
 _current_subscriptions: dict[str, tuple] = {}
 _feed:               FeedManager    = None   # set in main()
@@ -663,9 +672,12 @@ async def _status_loop():
     """
     Print status block every 5 seconds when a position is open (you want
     to watch P&L tick), or every 60 seconds when flat (bar-level is enough).
+    Also updates the watchdog heartbeat on every iteration.
     """
+    global _last_heartbeat
     while True:
         await asyncio.sleep(5)
+        _last_heartbeat = _time.time()   # proof-of-life for the watchdog thread
         if bot_state.position is not None:
             _print_status()
         else:
@@ -886,6 +898,40 @@ async def main():
                 break
 
     threading.Thread(target=_keyboard_watcher, daemon=True).start()
+
+    # ── Watchdog thread ───────────────────────────────────────────────────────
+    def _watchdog():
+        """
+        OS thread — runs independently of the asyncio event loop.
+        If the event loop freezes (e.g. re-subscribe WebSocket hang),
+        asyncio tasks stop updating _last_heartbeat. After WATCHDOG_TIMEOUT
+        seconds of silence during market hours, restarts the process.
+        Open positions stay on Alpaca and are recovered on next startup.
+        """
+        _time.sleep(30)   # give the bot time to initialise before watching
+        while True:
+            _time.sleep(30)
+            now_et = datetime.datetime.now(tz=config.ET).strftime("%H:%M")
+            if not (_WATCHDOG_START <= now_et <= _WATCHDOG_END):
+                continue
+            if _last_heartbeat <= 0:
+                continue   # event loop hasn't started yet
+            stale = _time.time() - _last_heartbeat
+            if stale > _WATCHDOG_TIMEOUT:
+                logger.warning(
+                    "WATCHDOG: event loop silent for %.0fs — auto-restarting. "
+                    "Open positions will be recovered on startup.",
+                    stale,
+                )
+                _time.sleep(1)   # let the log flush
+                os.execl(sys.executable, sys.executable, *sys.argv)
+
+    threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
+    logger.info(
+        "Watchdog active — will auto-restart if event loop silent for >%ds "
+        "between %s and %s ET.",
+        _WATCHDOG_TIMEOUT, _WATCHDOG_START, _WATCHDOG_END,
+    )
 
     await asyncio.gather(
         _guarded(_feed.start,                          "feed"),
