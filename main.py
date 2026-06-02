@@ -141,6 +141,10 @@ async def on_spy_bar(bar):
             b.close,
         )
 
+    # SPY-level stop — check on every bar close while a position is open
+    if _market_open_event.is_set():
+        asyncio.create_task(_evaluate_spy_stop(b.close))
+
     # Update routing table every bar (no WebSocket changes — subscriptions fixed at open)
     # new_strikes initialised to zero so the BAR log below is always safe pre-market
     new_strikes = {"call_strike": 0.0, "put_strike": 0.0}
@@ -274,13 +278,14 @@ async def _evaluate_entry(symbol: str):
             return
 
         pos = Position(
-            symbol      = symbol,
-            side        = side,
-            strike      = strike,
-            qty         = qty,
-            entry_price = fill_price,
-            entry_time  = datetime.datetime.now(tz=config.ET),
-            order_id    = str(order.id),
+            symbol           = symbol,
+            side             = side,
+            strike           = strike,
+            qty              = qty,
+            entry_price      = fill_price,
+            entry_time       = datetime.datetime.now(tz=config.ET),
+            order_id         = str(order.id),
+            entry_spy_price  = bot_state.spy_price,
         )
         bot_state.open_position(pos)
         logger.info(
@@ -561,6 +566,54 @@ async def _option_subscriber():
     await asyncio.sleep(float("inf"))
 
 
+# ── SPY-level stop (bar-driven) ───────────────────────────────────────────────
+
+async def _evaluate_spy_stop(spy_close: float):
+    """
+    Fires on every 1-minute bar close. Exits the position if SPY has closed
+    SPY_STOP_BUFFER dollars past the entry SPY price against the position:
+      - Call: SPY close < entry_spy_price - SPY_STOP_BUFFER
+      - Put:  SPY close > entry_spy_price + SPY_STOP_BUFFER
+
+    Uses the underlying as a trend-reversal signal — cleaner than option mid
+    which is noisy from spreads and theta. A $0.10 buffer absorbs single-tick
+    noise while catching genuine reversals on bar 1–2.
+    """
+    pos = bot_state.position
+    if pos is None or bot_state.exit_pending:
+        return
+    if pos.entry_spy_price <= 0:
+        return
+
+    buf = config.SPY_STOP_BUFFER
+    if pos.side == "call" and spy_close >= pos.entry_spy_price - buf:
+        return
+    if pos.side == "put"  and spy_close <= pos.entry_spy_price + buf:
+        return
+
+    logger.info(
+        "SPY STOP: side=%s entry_spy=%.2f current_spy=%.2f buffer=%.2f",
+        pos.side, pos.entry_spy_price, spy_close, buf,
+    )
+
+    bot_state.exit_pending = True
+    quote = bot_state.get_quote(pos.symbol)
+    mid   = quote.mid if quote else pos.entry_price * config.STOP_MULT
+
+    order = await order_manager.close_position(pos.symbol, pos.qty_remaining)
+    fill  = order_manager.get_fill_price(order) if order else mid
+
+    pnl = bot_state.close_position(fill, "spy_stop")
+    bot_state.exit_pending = False
+    risk_manager.record_trade(pnl)
+
+    icon = "✅" if pnl >= 0 else "❌"
+    logger.info(
+        "%s SPY_STOP: %s fill=%.2f pnl=$%.2f | daily=$%.2f trades=%d",
+        icon, pos.symbol, fill, pnl, risk_manager.daily_pnl, risk_manager.trades_today,
+    )
+
+
 # ── Exit evaluation (quote-driven) ────────────────────────────────────────────
 
 async def _evaluate_exit(quote):
@@ -724,10 +777,19 @@ def _print_status():
         min_sign = "+" if pos.min_unreal_pnl >= 0 else ""
         max_sign = "+" if pos.max_unreal_pnl >= 0 else ""
 
+        # SPY stop level
+        spy_stop_level = (
+            round(pos.entry_spy_price - config.SPY_STOP_BUFFER, 2)
+            if pos.side == "call"
+            else round(pos.entry_spy_price + config.SPY_STOP_BUFFER, 2)
+        )
+        spy_arrow = "↓" if pos.side == "call" else "↑"
+
         lines += [
             "  " + "·" * 56,
             f"  POSITION: {pos.symbol}  ({pos.side.upper()} ${pos.strike:.0f})  |  in trade {time_in_trade}",
-            f"  Entry ${pos.entry_price:.2f}  ×  {pos.qty_remaining} contracts",
+            f"  Entry ${pos.entry_price:.2f}  ×  {pos.qty_remaining} contracts  |  "
+            f"Entry SPY ${pos.entry_spy_price:.2f}  SPY stop {spy_arrow}${spy_stop_level:.2f}",
             f"  Mid   ${current_mid:.2f}  ({pct_chg:+.0f}%)  |  "
             f"TP ${tp_price:.2f}  Stop ${stop_price:.2f}  |  {trail_str}",
             f"  Unrealised P&L: {pnl_sign}${unreal_pnl:.2f}  |  "

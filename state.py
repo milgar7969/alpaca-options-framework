@@ -31,9 +31,12 @@ class Position:
     entry_price:   float          # option mid at fill
     entry_time:    datetime.datetime
     order_id:      str
-    target1_hit:   bool  = False
-    qty_remaining: int   = 0
-    peak_mid:      float = 0.0   # highest option mid seen since entry — for peak trailing stop
+    target1_hit:     bool  = False
+    qty_remaining:   int   = 0
+    peak_mid:        float = 0.0   # highest option mid seen — for peak trailing stop
+    min_unreal_pnl:  float = 0.0   # most negative unrealized P&L seen since entry
+    max_unreal_pnl:  float = 0.0   # most positive unrealized P&L seen since entry
+    entry_spy_price: float = 0.0   # SPY bar-close price at entry — for SPY-level stop
 
     def __post_init__(self):
         if self.qty_remaining == 0:
