@@ -77,7 +77,7 @@ _entry_lock: asyncio.Lock = asyncio.Lock()
 # if stale for > WATCHDOG_TIMEOUT seconds during market hours, auto-restarts.
 import time as _time
 _last_heartbeat:     float = 0.0
-_WATCHDOG_TIMEOUT    = 180   # seconds — restart if event loop silent this long
+_WATCHDOG_TIMEOUT    = 20    # seconds — restart if event loop silent this long
 _WATCHDOG_START      = "09:00"   # ET — only watch after this time
 _WATCHDOG_END        = "15:35"   # ET — stop watching after this time
 
@@ -910,7 +910,7 @@ async def main():
         """
         _time.sleep(30)   # give the bot time to initialise before watching
         while True:
-            _time.sleep(30)
+            _time.sleep(10)
             now_et = datetime.datetime.now(tz=config.ET).strftime("%H:%M")
             if not (_WATCHDOG_START <= now_et <= _WATCHDOG_END):
                 continue
@@ -928,8 +928,8 @@ async def main():
 
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     logger.info(
-        "Watchdog active — will auto-restart if event loop silent for >%ds "
-        "between %s and %s ET.",
+        "Watchdog active — checks every 10s, restarts if silent >%ds "
+        "between %s and %s ET (max downtime ~20s).",
         _WATCHDOG_TIMEOUT, _WATCHDOG_START, _WATCHDOG_END,
     )
 
