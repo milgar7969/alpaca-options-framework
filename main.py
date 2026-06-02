@@ -864,12 +864,21 @@ async def main():
                     if line == "q":
                         logger.info("Keyboard quit requested.")
                         future = asyncio.run_coroutine_threadsafe(_shutdown("keyboard"), loop)
-                        future.result(timeout=8)
+                        try:
+                            future.result(timeout=8)
+                        except Exception:
+                            # Event loop may be frozen — force exit regardless
+                            logger.warning("Event loop unresponsive — forcing exit.")
                         os._exit(0)
                     elif line == "r":
                         logger.info("Keyboard restart requested — positions left open for recovery.")
                         future = asyncio.run_coroutine_threadsafe(_soft_shutdown("restart"), loop)
-                        future.result(timeout=8)
+                        try:
+                            future.result(timeout=8)
+                        except Exception:
+                            # Event loop may be frozen — restart anyway, position
+                            # stays on Alpaca and will be recovered on next startup.
+                            logger.warning("Event loop unresponsive — forcing restart.")
                         os.execl(sys.executable, sys.executable, *sys.argv)
                     elif line == "t":
                         _print_trades()
