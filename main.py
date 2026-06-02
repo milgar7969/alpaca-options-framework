@@ -494,21 +494,29 @@ async def _resubscribe_watcher():
         _current_subscriptions = _build_routing_table(new_strikes)
         _last_sub_spy_price    = spy
 
-        # Attempt WebSocket expansion — wrapped in try/except so a stream
-        # hiccup never kills bar delivery. If this fails, routing table is
-        # already updated so entry logic stays correct for the current window.
+        # Attempt WebSocket expansion in a thread executor with a 5-second timeout.
+        # subscribe_quotes() is a synchronous call that can block the event loop
+        # indefinitely if the WebSocket is in a bad state — confirmed on Jun 1 & 2.
+        # Running in an executor isolates the block to a thread; wait_for cancels
+        # it after 5 seconds so the event loop (and bar stream) is never frozen.
+        # Routing table is already updated above, so entry logic stays correct
+        # even if the WebSocket expansion fails or times out.
         try:
-            _feed.add_option_symbols(new_symbols)
+            loop = asyncio.get_event_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(None, _feed.add_option_symbols, new_symbols),
+                timeout=5.0,
+            )
             logger.info(
                 "Re-subscribed: call=%.2f put=%.2f | %d symbols total",
                 new_strikes["call_strike"], new_strikes["put_strike"], len(new_symbols),
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Re-subscribe timed out after 5s — routing table updated, WebSocket unchanged"
+            )
         except Exception as e:
             logger.warning("Re-subscribe WebSocket call failed (routing table updated): %s", e)
-        logger.info(
-            "Re-subscribed: call=%.2f put=%.2f | %d symbols total",
-            new_strikes["call_strike"], new_strikes["put_strike"], len(new_symbols),
-        )
 
 
 # ── Market-open option subscriber ────────────────────────────────────────────
@@ -570,6 +578,13 @@ async def _evaluate_exit(quote):
     # Update peak mid — monotonically increasing, safe under concurrency
     if mid > pos.peak_mid:
         pos.peak_mid = mid
+
+    # Track min/max unrealized P&L for terminal display
+    unreal_pnl = (mid - pos.entry_price) * pos.qty_remaining * 100
+    if unreal_pnl < pos.min_unreal_pnl:
+        pos.min_unreal_pnl = unreal_pnl
+    if unreal_pnl > pos.max_unreal_pnl:
+        pos.max_unreal_pnl = unreal_pnl
 
     if mid >= tp_price:
         reason = "tp"
@@ -690,15 +705,21 @@ def _print_status():
         # Peak trailing stop display
         trail_armed = pos.peak_mid >= pos.entry_price * config.PEAK_TRAIL_ACTIVATE
         trail_stop  = round(pos.peak_mid * config.PEAK_TRAIL_PCT, 2) if trail_armed else None
-        trail_str   = (f"  Trail ${trail_stop:.2f} (peak ${pos.peak_mid:.2f})" if trail_armed
-                       else f"  Trail ARMED @ ${pos.entry_price * config.PEAK_TRAIL_ACTIVATE:.2f}")
+        trail_str   = (f"Trail ${trail_stop:.2f} (peak ${pos.peak_mid:.2f})" if trail_armed
+                       else f"Trail ARMED @ ${pos.entry_price * config.PEAK_TRAIL_ACTIVATE:.2f}")
+
+        # Min/max unrealized P&L
+        min_sign = "+" if pos.min_unreal_pnl >= 0 else ""
+        max_sign = "+" if pos.max_unreal_pnl >= 0 else ""
+
         lines += [
             "  " + "·" * 56,
             f"  POSITION: {pos.symbol}  ({pos.side.upper()} ${pos.strike:.0f})  |  in trade {time_in_trade}",
             f"  Entry ${pos.entry_price:.2f}  ×  {pos.qty_remaining} contracts",
             f"  Mid   ${current_mid:.2f}  ({pct_chg:+.0f}%)  |  "
-            f"TP ${tp_price:.2f}  Stop ${stop_price:.2f}",
-            f"  Unrealised P&L: {pnl_sign}${unreal_pnl:.2f}  |{trail_str}",
+            f"TP ${tp_price:.2f}  Stop ${stop_price:.2f}  |  {trail_str}",
+            f"  Unrealised P&L: {pnl_sign}${unreal_pnl:.2f}  |  "
+            f"min {min_sign}${pos.min_unreal_pnl:.2f}  max {max_sign}${pos.max_unreal_pnl:.2f}",
         ]
     else:
         cooldown = getattr(risk_manager, "_cooldown_bars", 0)
