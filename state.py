@@ -47,9 +47,11 @@ class Position:
 
 class BotState:
     def __init__(self):
-        self.spy_price:   float = 0.0
-        self.position:    Optional[Position] = None
+        self.spy_price:    float = 0.0
+        self.position:     Optional[Position] = None
         self.exit_pending: bool = False   # True while a close_position order is in-flight
+        self.entry_pending: bool = False  # True while a buy_limit order is in-flight
+                                          # Blocks concurrent entries from other quote ticks
 
         # Latest quotes per option symbol  {symbol: Quote}
         self.option_quotes: Dict[str, Quote] = {}

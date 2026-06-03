@@ -71,10 +71,31 @@ class OrderManager:
             logger.error("BUY submit failed: %s", e)
             return None
 
-        filled = await self._wait_for_fill(order.id)
+        try:
+            filled = await self._wait_for_fill(order.id)
+        except asyncio.CancelledError:
+            # Task was cancelled while waiting for fill — cancel the Alpaca order
+            # before propagating so it doesn't sit open unmonitored.
+            logger.warning("BUY fill-wait cancelled — cancelling Alpaca order %s", order.id)
+            self._cancel(order.id)
+            raise
+
         if filled is None:
             logger.warning("BUY timed out, cancelling: %s", order.id)
             self._cancel(order.id)
+            # Give Alpaca a moment then verify the order didn't fill after timeout
+            await asyncio.sleep(1)
+            try:
+                status = self._client.get_order_by_id(str(order.id))
+                if status.status == OrderStatus.FILLED:
+                    logger.warning(
+                        "BUY filled after timeout — recovering fill: %s avg=%.2f",
+                        order.id, float(status.filled_avg_price or 0),
+                    )
+                    return status   # return filled order so position is tracked locally
+            except Exception as e:
+                logger.error("Post-timeout order check failed: %s", e)
+
         return filled
 
     # ── Exit ──────────────────────────────────────────────────────────────────

@@ -223,6 +223,8 @@ async def on_option_quote(quote):
     # Entry evaluation
     if bot_state.position is not None:
         return
+    if bot_state.entry_pending:          # buy already in-flight on another quote tick
+        return
     if sym not in _current_subscriptions:
         return
     if not _entry_lock.locked():
@@ -266,15 +268,25 @@ async def _evaluate_entry(symbol: str):
         limit_price = round(entry_mid * 1.02, 2)
 
         logger.info("Placing entry: %s qty=%d limit=%.2f", symbol, qty, limit_price)
-        order = await order_manager.buy_limit(symbol, qty, limit_price)
+
+        # Set entry_pending before the async buy so any concurrent quote ticks
+        # (including CancelledError scenarios) see a buy is already in-flight.
+        bot_state.entry_pending = True
+        try:
+            order = await order_manager.buy_limit(symbol, qty, limit_price)
+        finally:
+            bot_state.entry_pending = False
 
         if order is None:
-            logger.warning("Entry failed/timed out for %s", symbol)
+            logger.warning("Entry failed/timed out for %s — cancelling all option orders",
+                           symbol)
+            order_manager.cancel_all_options()   # clean up any ghost orders
             return
 
         fill_price = order_manager.get_fill_price(order)
         if fill_price <= 0:
             logger.warning("Fill price unavailable for %s", symbol)
+            order_manager.cancel_all_options()
             return
 
         pos = Position(
@@ -877,6 +889,12 @@ async def main():
             bot_state.spy_price = seed_bars[-1].close
     except Exception as e:
         logger.warning("Pre-seed failed (%s) — EMAs will warm from live bars.", e)
+
+    # Cancel any pending option orders left over from a previous crash.
+    # This clears ghost orders that may have been submitted but not filled
+    # (or filled after a timeout) before the previous session ended.
+    logger.info("Cancelling any pending option orders from previous session...")
+    order_manager.cancel_all_options()
 
     # Check for any position left open from a previous run (e.g. after 'r' restart)
     _recover_open_position()
