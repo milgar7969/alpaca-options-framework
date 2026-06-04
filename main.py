@@ -141,9 +141,11 @@ async def on_spy_bar(bar):
             b.close,
         )
 
-    # SPY-level stop — check on every bar close while a position is open
     if _market_open_event.is_set():
+        # SPY-level stop — check on every bar close while a position is open
         asyncio.create_task(_evaluate_spy_stop(b.close))
+        # Ghost sweeper — close any Alpaca option positions not tracked locally
+        asyncio.create_task(_check_ghost_positions())
 
     # Update routing table every bar (no WebSocket changes — subscriptions fixed at open)
     # new_strikes initialised to zero so the BAR log below is always safe pre-market
@@ -576,6 +578,56 @@ async def _option_subscriber():
     )
     # One-shot task — sleep until cancelled so _guarded doesn't restart it
     await asyncio.sleep(float("inf"))
+
+
+# ── Ghost position sweeper (bar-driven) ──────────────────────────────────────
+
+async def _check_ghost_positions():
+    """
+    Called on every 1-min bar close. Fetches all open option positions from
+    Alpaca REST and closes any that are NOT tracked in bot_state.
+
+    Ghost positions arise when a buy_limit order fills on Alpaca after a
+    CancelledError disrupts local tracking. Without this sweeper they sit
+    open and unmonitored until the next restart (potentially hours).
+
+    Max detection window: 60 seconds (one bar). Ghost is closed immediately
+    once detected regardless of exit_pending or other state.
+    """
+    if bot_state.exit_pending:
+        return   # don't interfere while a tracked exit is in-flight
+    try:
+        alpaca_positions = order_manager.get_open_positions()
+    except Exception as e:
+        logger.debug("Ghost sweep REST call failed: %s", e)
+        return
+
+    for p in alpaca_positions:
+        try:
+            if p.asset_class != AssetClass.US_OPTION:
+                continue
+            sym     = p.symbol
+            qty     = int(float(p.qty))
+            avg_px  = float(p.avg_entry_price or 0)
+            tracked = bot_state.position
+
+            # Close if Alpaca has a position we don't know about locally
+            if tracked is not None and tracked.symbol == sym:
+                continue   # this is our known position — leave it alone
+
+            logger.warning(
+                "GHOST POSITION DETECTED: %s qty=%d avg=%.2f — closing immediately",
+                sym, qty, avg_px,
+            )
+            order = await order_manager.close_position(sym, qty)
+            fill  = order_manager.get_fill_price(order) if order else 0.0
+            pnl   = (fill - avg_px) * qty * 100
+            logger.warning(
+                "GHOST CLOSED: %s fill=%.2f pnl=$%.2f",
+                sym, fill, pnl,
+            )
+        except Exception as e:
+            logger.error("Ghost close failed for %s: %s", p.symbol if hasattr(p, 'symbol') else '?', e)
 
 
 # ── SPY-level stop (bar-driven) ───────────────────────────────────────────────
