@@ -87,7 +87,7 @@ def select_strikes(
     spy_price = _current_spy_price(stock_client)
     atr       = _atr_5day(stock_client)
 
-    offset = config.ATR_MULT * atr
+    offset = min(config.ATR_MULT * atr, config.MAX_STRIKE_OFFSET)
 
     call_target = _round_to_step(spy_price + offset, config.STRIKE_STEP)
     put_target  = _round_to_step(spy_price - offset, config.STRIKE_STEP)
@@ -196,8 +196,11 @@ def compute_dynamic_strikes(
     # The 1-min live ATR from the momentum engine is intentionally NOT used here
     # because premarket and early-session 1-min ranges are too small to be meaningful
     # for daily strike offset calculation.
-    call_target = _round_to_step(spy_price + config.ATR_MULT * atr, config.STRIKE_STEP)
-    put_target  = _round_to_step(spy_price - config.ATR_MULT * atr, config.STRIKE_STEP)
+    # MAX_STRIKE_OFFSET caps the offset so elevated 5-day ATR doesn't push strikes
+    # beyond the approach zone on low-realized-range days.
+    offset      = min(config.ATR_MULT * atr, config.MAX_STRIKE_OFFSET)
+    call_target = _round_to_step(spy_price + offset, config.STRIKE_STEP)
+    put_target  = _round_to_step(spy_price - offset, config.STRIKE_STEP)
 
     # Build target ± STRIKE_ALTS strikes — wide enough to survive SPY moving several
     # dollars intraday without needing to re-subscribe mid-session.

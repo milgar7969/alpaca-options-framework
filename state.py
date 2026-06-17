@@ -37,6 +37,7 @@ class Position:
     min_unreal_pnl:  float = 0.0   # most negative unrealized P&L seen since entry
     max_unreal_pnl:  float = 0.0   # most positive unrealized P&L seen since entry
     entry_spy_price: float = 0.0   # SPY bar-close price at entry — for SPY-level stop
+    entry_atr5:      float = 0.0   # atr5 at entry — scales the SPY-level stop buffer
 
     def __post_init__(self):
         if self.qty_remaining == 0:

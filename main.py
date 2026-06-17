@@ -300,6 +300,7 @@ async def _evaluate_entry(symbol: str):
             entry_time       = datetime.datetime.now(tz=config.ET),
             order_id         = str(order.id),
             entry_spy_price  = bot_state.spy_price,
+            entry_atr5       = momentum_engine.state.atr5,
         )
         bot_state.open_position(pos)
         logger.info(
@@ -635,13 +636,13 @@ async def _check_ghost_positions():
 async def _evaluate_spy_stop(spy_close: float):
     """
     Fires on every 1-minute bar close. Exits the position if SPY has closed
-    SPY_STOP_BUFFER dollars past the entry SPY price against the position:
-      - Call: SPY close < entry_spy_price - SPY_STOP_BUFFER
-      - Put:  SPY close > entry_spy_price + SPY_STOP_BUFFER
+    (SPY_STOP_ATR_MULT × atr5_at_entry) dollars past the entry SPY price:
+      - Call: SPY close < entry_spy_price - buf
+      - Put:  SPY close > entry_spy_price + buf
 
-    Uses the underlying as a trend-reversal signal — cleaner than option mid
-    which is noisy from spreads and theta. A $0.10 buffer absorbs single-tick
-    noise while catching genuine reversals on bar 1–2.
+    Buffer scales with intrabar volatility at entry so the stop is tighter on
+    calm entries and wider on choppy ones — reducing whipsaw false-stops.
+    SPY_STOP_FLOOR prevents a near-zero early-session atr5 from collapsing buf.
     """
     pos = bot_state.position
     if pos is None or bot_state.exit_pending:
@@ -649,15 +650,16 @@ async def _evaluate_spy_stop(spy_close: float):
     if pos.entry_spy_price <= 0:
         return
 
-    buf = config.SPY_STOP_BUFFER
+    buf = max(config.SPY_STOP_FLOOR, config.SPY_STOP_ATR_MULT * pos.entry_atr5)
     if pos.side == "call" and spy_close >= pos.entry_spy_price - buf:
         return
     if pos.side == "put"  and spy_close <= pos.entry_spy_price + buf:
         return
 
     logger.info(
-        "SPY STOP: side=%s entry_spy=%.2f current_spy=%.2f buffer=%.2f",
+        "SPY STOP: side=%s entry_spy=%.2f current_spy=%.2f buf=%.2f (atr5=%.3f × %.2f)",
         pos.side, pos.entry_spy_price, spy_close, buf,
+        pos.entry_atr5, config.SPY_STOP_ATR_MULT,
     )
 
     bot_state.exit_pending = True
@@ -841,11 +843,12 @@ def _print_status():
         min_sign = "+" if pos.min_unreal_pnl >= 0 else ""
         max_sign = "+" if pos.max_unreal_pnl >= 0 else ""
 
-        # SPY stop level
+        # SPY stop level (adaptive: SPY_STOP_ATR_MULT × atr5_at_entry, floored at SPY_STOP_FLOOR)
+        spy_buf = max(config.SPY_STOP_FLOOR, config.SPY_STOP_ATR_MULT * pos.entry_atr5)
         spy_stop_level = (
-            round(pos.entry_spy_price - config.SPY_STOP_BUFFER, 2)
+            round(pos.entry_spy_price - spy_buf, 2)
             if pos.side == "call"
-            else round(pos.entry_spy_price + config.SPY_STOP_BUFFER, 2)
+            else round(pos.entry_spy_price + spy_buf, 2)
         )
         spy_arrow = "↓" if pos.side == "call" else "↑"
 
