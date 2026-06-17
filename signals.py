@@ -5,7 +5,7 @@ This file is the strategy layer. The framework ships with a placeholder
 check_entry() so you can see the interface and plug in your own logic.
 
 For a full working implementation (entry filters, ATR gate, zone checks,
-proxy delta, exit rules) see the 0DTE SPY gamma bot write-up on r/algotrading.
+proxy delta, exit rules) see the 0DTE SPY gamma bot write-up on r/alpacamarkets.
 
 Key concepts
 ------------

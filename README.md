@@ -4,7 +4,7 @@ A production-ready Python framework for building **live options trading bots on 
 
 This repo solves the hard infrastructure problems — real-time streaming, position management, order execution, and all the Alpaca API quirks — so you can focus on your strategy.
 
-> **Note:** This repo includes a full working 0DTE SPY gamma explosion strategy — all parameters, entry/exit logic, and live session write-ups. See the r/algotrading post series for the full breakdown of what works, what breaks, and why.
+> **Note:** This repo includes a full working 0DTE SPY gamma explosion strategy — all parameters, entry/exit logic, and live session write-ups. See the r/alpacamarkets post series for the full breakdown of what works, what breaks, and why.
 
 ---
 
