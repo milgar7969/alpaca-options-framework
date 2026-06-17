@@ -1,12 +1,11 @@
 """
 Signal engine — entry and exit logic.
 
-This file is the strategy layer. The framework ships with placeholder
-implementations so you can plug in your own logic.
+This file is the strategy layer. The framework ships with a placeholder
+check_entry() so you can see the interface and plug in your own logic.
 
-A complete 0DTE momentum strategy implementation (entry filters, ATR gate,
-zone checks, proxy delta, exit rules) is available as a paid add-on at:
-https://gumroad.com/milgar7969  [coming soon]
+For a full working implementation (entry filters, ATR gate, zone checks,
+proxy delta, exit rules) see the 0DTE SPY gamma bot write-up on r/algotrading.
 
 Key concepts
 ------------
@@ -121,8 +120,7 @@ def check_entry(
     guards (time window, position limit, daily trade cap) but does
     NOT implement any directional or signal logic.
 
-    Replace this function with your own strategy. A complete
-    implementation is available at: https://gumroad.com/milgar7969
+    Replace this function with your own strategy.
 
     Suggested filters to implement:
         - Momentum direction match (BULL for calls, BEAR for puts)
