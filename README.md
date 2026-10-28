@@ -45,6 +45,9 @@ If an `asyncio.CancelledError` tears through your buy task mid-fill-wait (WebSoc
 **9. Feed teardown can hang the event loop at end-of-day**
 Stopping the WebSocket streams (`feed.stop()`) can block the event loop for 20+ seconds. If you run a watchdog that restarts on a silent loop, this creates a restart cascade: each fresh boot is already past the time stop, immediately re-fires it, hangs again, restarts again. The framework sidesteps the teardown entirely — after the time stop closes all positions, it **verifies the account is flat via REST (with retries), then hard-exits with `os._exit(0)`**. Observed live: flat-check plus exit completes in under 100ms.
 
+**10. The interrupt that hits your buy isn't always a `CancelledError`**
+Quirk #8's recovery path never fired live: when a buy gets interrupted mid-fill-wait, the exception that actually arrives is often `AttributeError: 'CANCELLED'` from inside alpaca-py, not `asyncio.CancelledError`. Meanwhile the next quote tick sees no position and fires a *second* buy, which leaves you with a duplicate fill. The framework catches `(asyncio.CancelledError, Exception)` around the buy. On any ambiguous outcome it keeps `entry_pending` **latched** so no duplicate can fire, cancels open option orders, and auto-releases the latch after 20 seconds so entries can't wedge. A late fill that slips through is still caught by the ghost sweeper.
+
 ---
 
 ## Architecture
@@ -79,11 +82,14 @@ alpaca-options-framework/
 ├── feeds.py        WebSocket stream manager (subscribe / add_option_symbols)
 ├── orders.py       Alpaca TradingClient wrapper (buy_limit / close_position)
 ├── state.py        Session state: position, quote cache, peak_mid tracking, CSV log
-├── risk.py         Position sizing, daily loss gate, cooldown, P&L restore
+├── risk.py         Position sizing, daily loss / profit-target / win-streak gates,
+│                     cooldown, P&L restore
 ├── strikes.py      ATR calculation, dynamic strike selection, OCC symbol builder
 ├── momentum.py     EMA5/EMA20, VWAP, ROC5, atr5, consecutive bar engine
 │
 ├── orb_filter.py   Clock-hour ORB directional regime filter (shadow mode)
+├── exit_shadow.py  Exit-parameter shadow: virtual twins under alternative exit rules
+├── gate_shadow.py  Gate-continuation shadow: what if we hadn't stopped for the day?
 ├── kpi_dashboard.py  Self-contained HTML KPI report generator (see below)
 │
 └── signals.py      Entry and exit signal logic — the LIVE strategy, as traded
@@ -135,12 +141,13 @@ Return `True` to trigger a limit buy. The framework handles sizing, order submis
 python main.py
 ```
 
-The bot waits for 9:30 ET, subscribes options at the actual open price, and becomes active at 9:45 ET. Force-closes all positions at 3:25 PM ET.
+The bot waits for 9:30 ET, subscribes options at the actual open price, and takes new entries from 9:45 ET until noon (`ENTRY_END = "12:00"`; afternoons bled on paper, so the window was cut from 14:30). Open positions keep managing their exits after noon. Force-closes all positions at 3:25 PM ET.
 
 **Terminal controls:**
 - `q + Enter` — quit cleanly (closes all positions)
 - `r + Enter` — restart (leaves positions open, recovers on next start)
 - `t + Enter` — print today's trade table
+- `o + Enter` — print the watched option window: every entry-eligible symbol with live bid/ask/mid and quote age. A row stuck on "no quote yet" after the open usually means the contract doesn't exist; check that `STRIKE_STEP` matches your underlying's real strike spacing.
 
 ---
 
@@ -157,12 +164,21 @@ On every option quote tick for the held symbol:
        trail_stop = peak_mid × PEAK_TRAIL_PCT
        IF mid <= trail_stop         → close_position() → "peak_trail"
 
+On every SPY 1-min bar close:
+  5. buf = max(SPY_STOP_FLOOR, SPY_STOP_ATR_MULT × atr5_at_entry)
+     IF SPY closed more than buf past the entry SPY price, against the position
+                                    → close_position() → "spy_stop"
+
 Every 30 seconds (safety net — covers WebSocket reconnect gaps):
   → re-evaluates the same conditions using the cached quote
 
 At 3:25 PM ET (time stop watcher):
   → close_position() → "time_stop"
 ```
+
+In practice the **SPY-level stop is the real loss exit**: it cuts a trade when the *underlying* moves against you, long before a 0DTE option decays to the 50% hard stop. The buffer scales with intrabar volatility at entry, so it's tighter in calm tape and wider in chop.
+
+**Session gates (new entries only):** besides the daily loss limit, `PROFIT_TARGET` (default $125 realized) and `CONSEC_WIN_STOP` (default 3 wins in a row) lock new entries for the rest of the day. An open position still exits normally. Both reset each morning. Across a mid-day restart the P&L-based locks are restored, but the win-streak counter resets.
 
 **Race-condition safety:** `exit_pending` is set to `True` before the first `await` in `_evaluate_exit()`. Because asyncio is cooperative (no preemption between synchronous lines), no duplicate exit orders can be submitted even when multiple quote ticks arrive simultaneously.
 
@@ -183,6 +199,13 @@ ORB_SHADOW | ALLOW: SPY260702P00746000 side=put bias=put
 
 It always returns `True` — zero effect on trading. After enough sessions you can score every BLOCK against the trade's actual P&L and decide with data, not backtest hope, whether to flip it live (a two-line change). Backtests lie in subtle ways — pre-market data availability, restart behavior, bar timing. Shadow mode tests the filter in the exact code path that would run it.
 
+The same idea, extended to exits and session gates:
+
+- **`exit_shadow.py`**: on every real entry it spawns virtual "twins" under alternative exit parameters (a tighter trail, a wider SPY-stop, no SPY-stop at all) plus a `baseline` twin that mirrors the live config. All twins consume the same live quote stream and settle at the bid. A wider stop fires *later* than the live one, so twins outlive the real exit and keep tracking quotes until their own rule triggers. Compare each variant against `baseline` rather than against booked P&L: they share the same fill model, so the comparison is apples-to-apples.
+- **`gate_shadow.py`**: once a profit-target or win-streak gate locks the bot, it keeps taking the entries the bot *would* have taken as virtual positions, with the same cooldown, noon cutoff and sizer. At the time stop it logs `actual vs would-have`, so you can tell whether stopping saved money or cost it.
+
+Twins place no orders, and every call into them is wrapped in try/except, so a bug there can't touch a live order. One lesson from running them: a variant that looks great for a few weeks can flip sign when the market regime changes. Give a shadow months, not days, before you ship it.
+
 ---
 
 ## KPI Dashboard
@@ -192,11 +215,14 @@ It always returns `True` — zero effect on trading. After enough sessions you c
 - Equity curve and daily P&L over a rolling calendar window (`--days 30`)
 - Win rate, profit factor, EV/trade, breakdowns by exit reason / side / entry hour
 - **True account P&L**: parses ghost-sweeper closes out of the bot logs and adds them to the booked CSV totals — duplicate fills don't silently vanish from your stats
-- Shadow-filter scoreboard: actual vs. would-have-been-filtered P&L, every block listed
+- Shadow scoreboards: ORB filter (actual vs. would-have-been-filtered, every block listed) and exit-variant running tallies vs. baseline
 
 ```bash
-python kpi_dashboard.py --days 30 --out dashboard/index.html
+python kpi_dashboard.py                      # builds every window: index.html (30d) + index-60/90/180/360.html
+python kpi_dashboard.py --days 90 --out dashboard/index.html   # one window only
 ```
+
+Each page carries a 30 / 60 / 90 / 180 / 360-day selector bar linking the others.
 
 Push the output to any static host (GitHub Pages works fine) for a public, auto-updating track record.
 
