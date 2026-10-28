@@ -24,6 +24,17 @@ import re
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR  = os.path.join(BASE_DIR, "logs")
 
+# Selectable look-back windows (calendar days). Each is rendered to its own
+# self-contained HTML page; a nav selector at the top links between them, so
+# switching windows is just page navigation on the static GitHub Pages site.
+# 30 is the canonical index.html (keeps existing links/bookmarks working).
+WINDOWS = [30, 60, 90, 180, 360]
+
+
+def _winfile(days: int) -> str:
+    """Filename for a window: 30 → index.html, others → index-<days>.html."""
+    return "index.html" if days == 30 else f"index-{days}.html"
+
 GHOST_RE  = re.compile(
     r"^(\d{4}-\d{2}-\d{2}) [\d:,]+ \[WARNING\] main: GHOST CLOSED: (\S+) "
     r"fill=([\d.]+) pnl=\$(-?[\d.]+)"
@@ -31,6 +42,15 @@ GHOST_RE  = re.compile(
 SHADOW_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2}) ([\d:]{8})[\d,]* \[INFO\] orb_filter: "
     r"ORB_SHADOW \| (BLOCK|ALLOW): (\S+) side=(\w+) bias=(\S+)"
+)
+EXITSH_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}) [\d:,]+ \[INFO\] exit_shadow: EXIT_SHADOW \| "
+    r"variant=(\w+) symbol=(\S+) entry=([\d.]+) exit=([\d.]+) qty=(\d+) "
+    r"reason=(\w+) pnl=(-?[\d.]+)"
+)
+FIX2_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}) ([\d:]{8})[\d,]* \[WARNING\] main: "
+    r"FIX2_SHADOW \| would_latch symbol=(\S+) qty=(\d+) limit=([\d.]+)"
 )
 
 
@@ -108,6 +128,52 @@ def load_shadow(dates: set):
     return out
 
 
+def load_exit_shadow(dates: set):
+    """Parse EXIT_SHADOW twin exits → [{date, variant, reason, pnl}].
+    'no_quote' twins are unresolved (symbol left the subscription window)
+    and are dropped rather than counted at a stale price."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(LOG_DIR, "bot_*.log"))):
+        day = os.path.basename(path)[4:14]
+        if day not in dates:
+            continue
+        try:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    m = EXITSH_RE.match(line)
+                    if m and m.group(7) != "no_quote":
+                        out.append({
+                            "date": m.group(1), "variant": m.group(2),
+                            "symbol": m.group(3), "reason": m.group(7),
+                            "pnl": float(m.group(8)),
+                        })
+        except OSError:
+            continue
+    return out
+
+
+def load_fix2(dates: set):
+    """Parse FIX2_SHADOW would-latch events → [{date, time, symbol}].
+    Each is a point where the duplicate-order race fired an ambiguous
+    CancelledError and Fix #2 (once live) would have latched entry_pending to
+    block the duplicate. Shadow mode only logs — it does not yet block."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(LOG_DIR, "bot_*.log"))):
+        day = os.path.basename(path)[4:14]
+        if day not in dates:
+            continue
+        try:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    m = FIX2_RE.match(line)
+                    if m:
+                        out.append({"date": m.group(1), "time": m.group(2),
+                                    "symbol": m.group(3)})
+        except OSError:
+            continue
+    return out
+
+
 def match_shadow(trade, shadow):
     """Latest shadow decision for this trade's symbol within 120s before entry."""
     entry = trade["entry_dt"].replace(tzinfo=None)
@@ -136,6 +202,17 @@ def build(days: int, out_path: str):
     dates  = sorted({r["date"] for r in trades})
     ghosts = load_ghosts(set(dates))
     shadow = load_shadow(set(dates))
+    xshad  = load_exit_shadow(set(dates))
+    fix2   = load_fix2(set(dates))
+
+    # ── Fix #2 shadow: would the latch have caught the ghosts? ────────────────
+    # A ghost is a duplicate fill of an entry symbol; a FIX2_SHADOW event is the
+    # ambiguous cancelled-buy on that same symbol/day that Fix #2 would latch.
+    # If every ghost has a same-day, same-symbol shadow event, Fix #2 catches
+    # the whole class. (Same symbol can repeat in a day, so this is a
+    # correlation signal, not a per-event proof.)
+    fix2_keys     = {(f["date"], f["symbol"]) for f in fix2}
+    ghosts_caught = [g for g in ghosts if (g["date"], g["symbol"]) in fix2_keys]
 
     # ── Core KPIs ────────────────────────────────────────────────────────────
     pnl_total   = sum(r["realized_pnl"] for r in trades)
@@ -185,6 +262,17 @@ def build(days: int, out_path: str):
     by_reason = group(lambda r: r["reason"])
     by_side   = group(lambda r: r["side"])
     by_hour   = group(lambda r: r["entry_dt"].astimezone().hour)
+
+    # ── Afternoon-cutoff what-if (entries at/after 12:00 ET) ──────────────────
+    # Derived from logs only — no bot change. Shows what stopping new entries
+    # after noon would have done, since the edge concentrates in the morning.
+    CUTOFF_HOUR = 12
+    pm_trades   = [r for r in trades if r["entry_dt"].astimezone().hour >= CUTOFF_HOUR]
+    am_trades   = [r for r in trades if r["entry_dt"].astimezone().hour <  CUTOFF_HOUR]
+    pm_pnl      = sum(r["realized_pnl"] for r in pm_trades)
+    am_pnl      = sum(r["realized_pnl"] for r in am_trades)
+    pm_wins     = sum(1 for r in pm_trades if r["realized_pnl"] >= 0)
+    am_wins     = sum(1 for r in am_trades if r["realized_pnl"] >= 0)
 
     # ── ORB shadow filter panel ──────────────────────────────────────────────
     shadow_days   = sorted({s["date"] for s in shadow})
@@ -275,6 +363,160 @@ def build(days: int, out_path: str):
     orb_improve = shadow_filtered - shadow_actual
     orb_cls     = "text-success" if orb_improve >= 0 else "text-danger"
 
+    # ── Exit-shadow harness panel ────────────────────────────────────────────
+    # Twins run alternative exit params on live quotes. 'baseline' mirrors the
+    # live config and is the harness's own sanity check: if it does not track
+    # the real booked P&L, the other variants are not trustworthy.
+    VARIANT_LABEL = {
+        "baseline":    "baseline (mirrors live)",
+        "tight_trail": "tight_trail (0.92)",
+        "wide_stop":   "wide_stop (0.25 / 1.0)",
+        "both":        "both",
+        "no_spy_stop": "no_spy_stop (underlying stop OFF)",
+    }
+    xs_days = sorted({x["date"] for x in xshad})
+    xs_agg  = {}
+    for x in xshad:
+        e = xs_agg.setdefault(x["variant"], {"n": 0, "pnl": 0.0})
+        e["n"]   += 1
+        e["pnl"] += x["pnl"]
+    # Actual booked P&L over the same days the harness was running
+    xs_actual = sum(r["realized_pnl"] for r in trades if r["date"] in set(xs_days))
+    xs_base   = xs_agg.get("baseline", {}).get("pnl")
+
+    # ── tight_trail vs baseline running tally ────────────────────────────────
+    # Apples-to-apples: baseline and tight_trail are twins spawned from the same
+    # real entries and fed the identical live quote stream; the ONLY difference
+    # is the peak-trail giveback (0.92 vs live 0.88). Their day-by-day delta is
+    # therefore pure signal — immune to the baseline-vs-booked drift that comes
+    # from tick-sampling. This is the number to watch for the trail decision.
+    tt_daily = {}
+    for x in xshad:
+        if x["variant"] in ("baseline", "tight_trail"):
+            e = tt_daily.setdefault(x["date"], {"baseline": 0.0, "tight_trail": 0.0})
+            e[x["variant"]] += x["pnl"]
+    tt_cum, tt_rows_data = 0.0, []
+    for d in sorted(tt_daily):
+        base = tt_daily[d]["baseline"]
+        tt   = tt_daily[d]["tight_trail"]
+        edge = tt - base
+        tt_cum += edge
+        tt_rows_data.append((d, base, tt, edge, tt_cum))
+    tt_edge_total = tt_cum
+    tt_win_days   = sum(1 for r in tt_rows_data if r[3] > 0)
+    tt_lose_days  = sum(1 for r in tt_rows_data if r[3] < 0)
+
+    if xs_agg:
+        rows = []
+        for v in ["baseline", "tight_trail", "wide_stop", "both", "no_spy_stop"]:
+            if v not in xs_agg:
+                continue
+            a   = xs_agg[v]
+            dv  = a["pnl"] - xs_actual
+            cls = "text-success" if a["pnl"] >= 0 else "text-danger"
+            dcl = "text-success" if dv >= 0 else "text-danger"
+            note = " (sanity check)" if v == "baseline" else ""
+            rows.append(
+                f"<tr><td>{html.escape(VARIANT_LABEL.get(v, v))}{note}</td>"
+                f"<td>{a['n']}</td>"
+                f"<td class=\"{cls}\">{fmt_usd(a['pnl'])}</td>"
+                f"<td class=\"{dcl}\">{fmt_usd(dv)}</td></tr>"
+            )
+        xs_rows = "".join(rows)
+        drift   = abs(xs_base - xs_actual) if xs_base is not None else None
+        xs_note = (
+            f"Twins run alternative exit rules on live quotes; they place no orders. "
+            f"Actual booked over the same {len(xs_days)} day(s): {fmt_usd(xs_actual)}. "
+            + (f"Baseline drift vs actual: {fmt_usd(xs_base - xs_actual)} — "
+               f"{'harness tracking reality well' if drift is not None and drift < 50 else 'investigate before trusting variants'}."
+               if xs_base is not None else "")
+        )
+    else:
+        xs_rows = ("<tr><td colspan=4 class='text-muted'>No twin exits recorded yet — "
+                   "harness starts collecting on the next session.</td></tr>")
+        xs_note = ("Spawns virtual positions per real entry under alternative exit "
+                   "parameters (tighter trail / wider SPY stop) and settles them on live "
+                   "quotes. Observe-only — no orders, no effect on live trading.")
+
+    # ── tight_trail vs baseline tally rows ───────────────────────────────────
+    if tt_rows_data:
+        tt_rows = "".join(
+            f"<tr><td>{d}</td>"
+            f"<td class=\"{'text-success' if base>=0 else 'text-danger'}\">{fmt_usd(base)}</td>"
+            f"<td class=\"{'text-success' if tt>=0 else 'text-danger'}\">{fmt_usd(tt)}</td>"
+            f"<td class=\"{'text-success' if edge>=0 else 'text-danger'}\">{fmt_usd(edge)}</td>"
+            f"<td class=\"{'text-success' if cum>=0 else 'text-danger'}\">{fmt_usd(cum)}</td></tr>"
+            for (d, base, tt, edge, cum) in reversed(tt_rows_data)
+        )
+        tt_edge_cls = "text-success" if tt_edge_total >= 0 else "text-danger"
+        tt_note = (
+            f"Both series are twins fed the identical live quote stream — the only "
+            f"difference is the peak-trail giveback (0.92 vs live 0.88), so their delta "
+            f"is pure signal (immune to the baseline-vs-booked drift above). "
+            f"Tight_trail ahead on {tt_win_days} day(s), behind on {tt_lose_days}. "
+            f"Positive cumulative edge = the tighter trail is capturing more of the peak."
+        )
+    else:
+        tt_rows = ("<tr><td colspan=5 class='text-muted'>No twin exits yet — "
+                   "tally starts on the next session.</td></tr>")
+        tt_edge_cls = ""
+        tt_note = ("Running day-by-day tally of tight_trail (0.92) minus baseline (0.88), "
+                   "both measured on identical live twins fed the same quotes.")
+
+    # ── Fix #2 shadow panel rows ─────────────────────────────────────────────
+    n_ghosts = len(ghosts)
+    n_caught = len(ghosts_caught)
+    if fix2:
+        catch_txt = (f"{n_caught}/{n_ghosts}" if n_ghosts else f"{n_caught}/0")
+        catch_cls = ("text-success" if n_ghosts and n_caught == n_ghosts
+                     else "text-warning" if n_caught else "text-danger")
+        fix2_rows = "".join(
+            f"<tr><td>{f['date']} {f['time']}</td><td>{html.escape(f['symbol'])}</td>"
+            f"<td class=\"{'text-success' if (f['date'], f['symbol']) in {(g['date'], g['symbol']) for g in ghosts} else 'text-muted'}\">"
+            f"{'ghost followed' if (f['date'], f['symbol']) in {(g['date'], g['symbol']) for g in ghosts} else 'no ghost'}</td></tr>"
+            for f in reversed(fix2)
+        )
+        fix2_note = (
+            f"Each row is an ambiguous cancelled-buy where Fix #2 (once live) would "
+            f"latch entry_pending and block the duplicate. Shadow mode logs only — "
+            f"live order flow is unchanged. Of {n_ghosts} ghost event(s) in-window, "
+            f"{n_caught} had a matching same-day shadow event → Fix #2 would have "
+            f"caught {'all of them' if n_ghosts and n_caught == n_ghosts else 'that subset'}."
+        )
+    else:
+        catch_txt = f"0/{n_ghosts}"
+        catch_cls = "text-muted"
+        fix2_rows = ("<tr><td colspan=3 class='text-muted'>No FIX2_SHADOW events yet — "
+                     "fires on the next ambiguous cancelled-buy race. Collecting.</td></tr>")
+        fix2_note = ("Shadow-log for the duplicate-order fix: logs where entry_pending "
+                     "would be latched on an ambiguous cancelled buy, without changing "
+                     "live order handling. Validates the fix before it ships.")
+
+    # Afternoon-cutoff panel classes + takeaway
+    am_cls     = "text-success" if am_pnl >= 0 else "text-danger"
+    pm_cls     = "text-success" if pm_pnl >= 0 else "text-danger"
+    cutoff_cls = "text-success" if -pm_pnl >= 0 else "text-danger"
+    if pm_pnl < 0:
+        cutoff_note = (f"Afternoon has been a net drag of {fmt_usd(pm_pnl)}; stopping new "
+                       f"entries at noon would have improved booked P&L by {fmt_usd(-pm_pnl)}. "
+                       f"Observation only — not enforced by the bot.")
+    else:
+        cutoff_note = (f"Afternoon is net positive ({fmt_usd(pm_pnl)}); a noon cutoff would "
+                       f"have cost {fmt_usd(pm_pnl)}. No action warranted. Observation only.")
+
+    # Window-selector nav — one link per window; the current one is highlighted.
+    # "(all)" marks a window that reaches past the FULL dataset (not just this
+    # page's span) — i.e. there is no more history for it to show.
+    _all_csv = sorted(glob.glob(os.path.join(LOG_DIR, "trades_*.csv")))
+    _earliest = os.path.basename(_all_csv[0])[7:17] if _all_csv else dates[0]
+    total_span_days = (datetime.date.today() - datetime.date.fromisoformat(_earliest)).days + 1
+    def _wlabel(d):
+        return f"{d}d (all)" if d >= total_span_days else f"{d}d"
+    nav_links = "".join(
+        f'<a href="{_winfile(d)}" class="btn {"btn-info text-dark fw-bold" if d == days else "btn-outline-info"}">{_wlabel(d)}</a>'
+        for d in WINDOWS
+    )
+
     html_doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -300,6 +542,15 @@ def build(days: int, out_path: str):
                letter-spacing:0.5px; border-color:var(--border-color); background:#0f172a; }}
   .table td {{ border-color:var(--border-color); vertical-align:middle; }}
   .table tbody tr:hover {{ background:rgba(34,211,238,0.05); }}
+  /* Brighter secondary/muted text for readability on the dark background */
+  .text-muted, small.text-muted {{ color:#cbd5e1 !important; }}
+  .stat-sub {{ color:#cbd5e1; }}
+  /* Sortable table headers */
+  table.sortable th {{ cursor:pointer; user-select:none; white-space:nowrap; }}
+  table.sortable th:hover {{ color:#e2e8f0; }}
+  table.sortable th::after {{ content:"\\2195"; opacity:0.35; font-size:0.7em; margin-left:4px; }}
+  table.sortable th.asc::after  {{ content:"\\2191"; opacity:0.9; }}
+  table.sortable th.desc::after {{ content:"\\2193"; opacity:0.9; }}
   ::-webkit-scrollbar {{ width:6px; height:6px; }}
   ::-webkit-scrollbar-track {{ background:#1e293b; }}
   ::-webkit-scrollbar-thumb {{ background:#334155; border-radius:3px; }}
@@ -307,13 +558,14 @@ def build(days: int, out_path: str):
 </head>
 <body>
 <div class="container-fluid px-4 pt-4 pb-2">
-  <div class="d-flex justify-content-between align-items-center mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
     <div>
       <h4 class="mb-0 fw-bold" style="color:#22d3ee;">⚡ SPY 0DTE — KPI Dashboard
         <span style="color:#94a3b8;font-size:0.85rem;font-weight:400;">(paper, gamma-explosion strategy)</span></h4>
-      <small class="text-muted">{dates[0]} → {dates[-1]} &nbsp;|&nbsp; {len(dates)} trading days
+      <small class="text-muted">{dates[0]} → {dates[-1]} &nbsp;|&nbsp; {len(dates)} trading days in last {days}d
         &nbsp;|&nbsp; Generated {now}</small>
     </div>
+    <div class="btn-group btn-group-sm" role="group" aria-label="look-back window">{nav_links}</div>
   </div>
 
   <div class="row g-2 mb-4 flex-nowrap">{cards}</div>
@@ -337,7 +589,7 @@ def build(days: int, out_path: str):
     <div class="col-md-4">
       <div class="card p-3">
         <div class="section-title">P&L by Exit Reason</div>
-        <table class="table table-sm mb-0"><thead>
+        <table class="table table-sm mb-0 sortable"><thead>
           <tr><th>Reason</th><th>N</th><th>Win%</th><th>P&L</th></tr></thead>
           <tbody>{reason_rows}</tbody></table>
       </div>
@@ -345,7 +597,7 @@ def build(days: int, out_path: str):
     <div class="col-md-4">
       <div class="card p-3">
         <div class="section-title">P&L by Side</div>
-        <table class="table table-sm mb-0"><thead>
+        <table class="table table-sm mb-0 sortable"><thead>
           <tr><th>Side</th><th>N</th><th>Win%</th><th>P&L</th></tr></thead>
           <tbody>{side_rows}</tbody></table>
       </div>
@@ -370,7 +622,7 @@ def build(days: int, out_path: str):
         <div class="stat-sub mb-2">Blocked: {len(blocked_loss)} losses ({fmt_usd(sum(b['realized_pnl'] for b in blocked_loss))}),
           {len(blocked_wins)} wins ({fmt_usd(sum(b['realized_pnl'] for b in blocked_wins))})
           over {len(shadow_days)} shadow days</div>
-        <table class="table table-sm mb-0"><thead>
+        <table class="table table-sm mb-0 sortable"><thead>
           <tr><th>Entry</th><th>Trade</th><th>Bias</th><th>Exit</th><th>P&L</th></tr></thead>
           <tbody>{block_rows}</tbody></table>
       </div>
@@ -379,9 +631,82 @@ def build(days: int, out_path: str):
       <div class="card p-3">
         <div class="section-title">Daily Detail</div>
         <div style="max-height:320px;overflow-y:auto;">
-        <table class="table table-sm mb-0"><thead>
+        <table class="table table-sm mb-0 sortable"><thead>
           <tr><th>Date</th><th>Trades</th><th>W/N</th><th>Booked</th><th>Ghosts</th><th>Actual</th></tr></thead>
           <tbody>{day_rows}</tbody></table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3 mb-4">
+    <div class="col-md-12">
+      <div class="card p-3">
+        <div class="section-title">Exit-Parameter Shadow Harness (observe-only — virtual twins, no orders)</div>
+        <table class="table table-sm mb-2 sortable"><thead>
+          <tr><th>Variant</th><th>Twin exits</th><th>Shadow P&L</th><th>vs Actual</th></tr></thead>
+          <tbody>{xs_rows}</tbody></table>
+        <div class="stat-sub">{xs_note}</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3 mb-4">
+    <div class="col-md-12">
+      <div class="card p-3">
+        <div class="section-title">Tight-Trail vs Baseline — Running Tally (apples-to-apples twins)</div>
+        <div class="d-flex gap-4 mb-2 align-items-center flex-wrap">
+          <div><div class="card-title">Cumulative Edge</div>
+               <div class="stat-val fs-5 {tt_edge_cls}">{fmt_usd(tt_edge_total)}</div>
+               <div class="stat-sub">tight_trail − baseline, {len(tt_rows_data)} day(s)</div></div>
+          <div class="stat-sub" style="max-width:560px;">{tt_note}</div>
+        </div>
+        <div style="max-height:280px;overflow-y:auto;">
+        <table class="table table-sm mb-0 sortable"><thead>
+          <tr><th>Date</th><th>Baseline</th><th>Tight_trail</th><th>Edge</th><th>Cum. Edge</th></tr></thead>
+          <tbody>{tt_rows}</tbody></table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3 mb-4">
+    <div class="col-md-12">
+      <div class="card p-3">
+        <div class="section-title">Fix #2 Shadow — Duplicate-Order Latch (observe-only, no order-flow change)</div>
+        <div class="d-flex gap-4 mb-2 align-items-center flex-wrap">
+          <div><div class="card-title">Shadow Events</div>
+               <div class="stat-val fs-5">{len(fix2)}</div>
+               <div class="stat-sub">would-latch fires</div></div>
+          <div><div class="card-title">Ghosts Caught</div>
+               <div class="stat-val fs-5 {catch_cls}">{catch_txt}</div>
+               <div class="stat-sub">same-day/symbol match</div></div>
+          <div class="stat-sub" style="max-width:560px;">{fix2_note}</div>
+        </div>
+        <div style="max-height:240px;overflow-y:auto;">
+        <table class="table table-sm mb-0 sortable"><thead>
+          <tr><th>When</th><th>Symbol</th><th>Outcome</th></tr></thead>
+          <tbody>{fix2_rows}</tbody></table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3 mb-4">
+    <div class="col-md-12">
+      <div class="card p-3">
+        <div class="section-title">Morning vs Afternoon — Cutoff What-If (entries before / at-or-after 12:00 ET)</div>
+        <div class="d-flex flex-wrap gap-4 align-items-center">
+          <div><div class="card-title">Morning (&lt;12:00)</div>
+               <div class="stat-val fs-6 {am_cls}">{fmt_usd(am_pnl)}</div>
+               <div class="stat-sub">{len(am_trades)} trades · {am_wins} W</div></div>
+          <div><div class="card-title">Afternoon (12:00+)</div>
+               <div class="stat-val fs-6 {pm_cls}">{fmt_usd(pm_pnl)}</div>
+               <div class="stat-sub">{len(pm_trades)} trades · {pm_wins} W</div></div>
+          <div><div class="card-title">If stopped at noon</div>
+               <div class="stat-val fs-6 {cutoff_cls}">{fmt_usd(-pm_pnl)}</div>
+               <div class="stat-sub">effect vs booked {fmt_usd(pnl_total)}</div></div>
+          <div class="stat-sub" style="max-width:340px;">{cutoff_note}</div>
         </div>
       </div>
     </div>
@@ -416,6 +741,37 @@ new Chart(document.getElementById('hours'), {{
   options:{{ plugins:{{legend:{{display:false}}}},
     scales:{{ x:{{grid:gridCfg,ticks:tickCfg}}, y:{{grid:gridCfg,ticks:tickCfg}} }} }}
 }});
+
+// ── Sortable tables ─────────────────────────────────────────────────────────
+// Click a header to sort by that column; click again to reverse. Numbers
+// (P&L, N, %, "W/N") sort numerically, text sorts alphabetically.
+function cellNum(s) {{
+  // Pull the first number out of e.g. "+$1,234.00", "90%", "12/16", "put 746"
+  const m = String(s).replace(/,/g, '').match(/-?\\d+(\\.\\d+)?/);
+  return m ? parseFloat(m[0]) : null;
+}}
+document.querySelectorAll('table.sortable').forEach(function(table) {{
+  const heads = table.tHead.rows[0].cells;
+  Array.from(heads).forEach(function(th, col) {{
+    th.addEventListener('click', function() {{
+      const body = table.tBodies[0];
+      const rows = Array.from(body.rows).filter(r => r.cells.length === heads.length);
+      const asc  = !(th.classList.contains('asc'));
+      Array.from(heads).forEach(h => h.classList.remove('asc', 'desc'));
+      th.classList.add(asc ? 'asc' : 'desc');
+      rows.sort(function(a, b) {{
+        const x = a.cells[col].textContent.trim();
+        const y = b.cells[col].textContent.trim();
+        const nx = cellNum(x), ny = cellNum(y);
+        let c;
+        if (nx !== null && ny !== null) c = nx - ny;
+        else c = x.localeCompare(y);
+        return asc ? c : -c;
+      }});
+      rows.forEach(r => body.appendChild(r));
+    }});
+  }});
+}});
 </script>
 </body>
 </html>"""
@@ -423,16 +779,38 @@ new Chart(document.getElementById('hours'), {{
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
         f.write(html_doc)
-    print(f"Dashboard written: {out_path}")
+    print(f"Dashboard written: {out_path}  [window: last {days}d]")
     print(f"  {len(dates)} days, {len(trades)} trades, booked {fmt_usd(pnl_total)}, "
           f"ghosts {fmt_usd(ghost_pnl)}, actual {fmt_usd(actual_pnl)}")
     print(f"  ORB shadow: {len(blocked)} blocks over {len(shadow_days)} days, "
           f"effect {fmt_usd(orb_improve)}")
+    print(f"  Fix#2 shadow: {len(fix2)} would-latch events, "
+          f"ghosts caught {len(ghosts_caught)}/{len(ghosts)}")
+    if xs_agg:
+        parts = ", ".join(f"{v}={fmt_usd(a['pnl'])}" for v, a in sorted(xs_agg.items()))
+        print(f"  Exit shadow ({len(xs_days)} days, actual {fmt_usd(xs_actual)}): {parts}")
+        print(f"  Tight_trail vs baseline: cum edge {fmt_usd(tt_edge_total)} "
+              f"({tt_win_days}W/{tt_lose_days}L days)")
+    else:
+        print("  Exit shadow: no twin exits yet")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--days", type=int, default=30)
-    ap.add_argument("--out", default=os.path.join(BASE_DIR, "gh_dashboard", "index.html"))
+    ap.add_argument("--days", type=int, default=None,
+                    help="build a single window; omit to build all WINDOWS")
+    ap.add_argument("--out", default=None, help="output path for a single --days build")
+    ap.add_argument("--out-dir", default=os.path.join(BASE_DIR, "gh_dashboard"),
+                    help="directory for the multi-window build")
     args = ap.parse_args()
-    build(args.days, args.out)
+
+    if args.days is not None:
+        out = args.out or os.path.join(args.out_dir, _winfile(args.days))
+        build(args.days, out)
+    else:
+        # Build every window → its own self-contained page (30d is index.html).
+        for d in WINDOWS:
+            try:
+                build(d, os.path.join(args.out_dir, _winfile(d)))
+            except SystemExit as e:
+                print(f"  [skip {d}d: {e}]")

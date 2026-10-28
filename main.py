@@ -46,6 +46,8 @@ from feeds import FeedManager
 from momentum import MomentumEngine, Bar
 from orders import OrderManager
 from risk import RiskManager
+from exit_shadow import ExitShadow
+from gate_shadow import GateShadow
 from orb_filter import ORBFilter
 from signals import check_entry
 from state import BotState, Position
@@ -71,8 +73,21 @@ bot_state       = BotState()
 risk_manager    = RiskManager()
 order_manager   = OrderManager()
 orb_filter      = ORBFilter()
+exit_shadow     = ExitShadow()
+gate_shadow     = GateShadow()
 
 _entry_lock: asyncio.Lock = asyncio.Lock()
+
+# FIX #2 (widened): when a buy is interrupted mid-flight — by asyncio
+# CancelledError OR a generic "handler error" Exception (the pathway feeds.py
+# swallows) — the order may be LIVE at Alpaca. We keep entry_pending LATCHED to
+# block the next quote tick from firing a duplicate entry (the 08/28 cascade
+# that spawned a 15-lot phantom). This records WHEN we latched so on_option_quote
+# can auto-release after a bounded window and never wedge entries permanently.
+# It is None during a normal in-flight buy (so the auto-release never disturbs
+# one) and set only on an interrupted buy.
+_entry_latched_at: float | None = None
+_ENTRY_LATCH_TIMEOUT_S = 20.0
 
 # ── Watchdog heartbeat ────────────────────────────────────────────────────────
 # Updated by _status_loop every iteration. Watchdog thread checks every 30s;
@@ -132,6 +147,7 @@ async def on_spy_bar(bar):
 
     # Tick cooldown counter
     risk_manager.tick_bar()
+    gate_shadow.tick_bar()   # observe-only continuation book mirrors the cooldown
 
     # ORB filter — update on every bar (records only the first bar of each hour)
     bar_time = b.t.astimezone(config.ET).time()
@@ -150,6 +166,15 @@ async def on_spy_bar(bar):
     if _market_open_event.is_set():
         # SPY-level stop — check on every bar close while a position is open
         asyncio.create_task(_evaluate_spy_stop(b.close))
+        # Shadow twins evaluate their own (wider) SPY stop on the same bar
+        try:
+            exit_shadow.on_spy_bar(b.close)
+        except Exception as e:
+            logger.error("exit_shadow.on_spy_bar failed (ignored): %s", e)
+        try:
+            gate_shadow.on_spy_bar(b.close)
+        except Exception as e:
+            logger.error("gate_shadow.on_spy_bar failed (ignored): %s", e)
         # Ghost sweeper — close any Alpaca option positions not tracked locally
         asyncio.create_task(_check_ghost_positions())
 
@@ -208,6 +233,17 @@ async def on_option_quote(quote):
     # Update proxy delta tracker
     bot_state.update_option_quote(sym, bid, ask, ts)
 
+    # Exit-parameter shadow twins — fed BEFORE any early return below, so twins
+    # keep receiving quotes after the real position closes (a wider stop fires
+    # later than the live one and must outlive the real exit). Observe-only.
+    try:
+        _sq = bot_state.get_quote(sym)
+        if _sq is not None:
+            exit_shadow.on_quote(sym, _sq.mid, bid)   # bid = live market-fill price
+            gate_shadow.on_quote(sym, _sq.mid, bid)   # gate-continuation twin, same stream
+    except Exception as e:
+        logger.debug("exit_shadow/gate_shadow.on_quote failed (ignored): %s", e)
+
     # Quote-driven exit — fires on every tick for the held symbol.
     # asyncio.create_task() schedules the coroutine on the event loop and
     # returns immediately, so close_position() is never called from inside
@@ -233,7 +269,21 @@ async def on_option_quote(quote):
     if bot_state.position is not None:
         return
     if bot_state.entry_pending:          # buy already in-flight on another quote tick
-        return
+        # FIX #2 anti-wedge: if this is a LATCH left by an interrupted buy (not a
+        # normal in-flight buy, for which _entry_latched_at is None), release it
+        # once the bounded window has passed so entries can resume. The latch's
+        # job is only to absorb the seconds around the interrupt where a duplicate
+        # would otherwise fire; a late fill that slips through is handled by the
+        # ghost sweeper.
+        global _entry_latched_at
+        if (_entry_latched_at is not None
+                and asyncio.get_event_loop().time() - _entry_latched_at > _ENTRY_LATCH_TIMEOUT_S):
+            logger.warning("FIX2: releasing stale entry_pending latch after %.0fs — re-arming entries",
+                           asyncio.get_event_loop().time() - _entry_latched_at)
+            _entry_latched_at = None
+            bot_state.entry_pending = False
+        else:
+            return
     if sym not in _current_subscriptions:
         return
     if not _entry_lock.locked():
@@ -242,11 +292,52 @@ async def on_option_quote(quote):
 
 # ── Entry evaluation ──────────────────────────────────────────────────────────
 
+def _shadow_gate_entry(symbol: str):
+    """Observe-only continuation book. After a profit-target / win-streak gate
+    locks the real bot, this records the entries the bot WOULD have taken and
+    runs them as virtual positions on the live quote stream (gate_shadow.py), so
+    we can log how the day would have ended without the stop. Places no orders."""
+    gate_shadow.activate(risk_manager.lock_reason, risk_manager.daily_pnl)
+    if not gate_shadow.can_enter():
+        return
+    side, strike = _current_subscriptions.get(symbol, (None, None))
+    if side is None:
+        return
+    quote   = bot_state.get_quote(symbol)
+    tracker = bot_state.get_tracker(symbol)
+    if quote is None:
+        return
+    if not check_entry(
+        side          = side,
+        strike        = strike,
+        option_quote  = quote,
+        momentum      = momentum_engine.state,
+        proxy_tracker = tracker,
+        spy_price     = bot_state.spy_price,
+        trades_today  = risk_manager.trades_today,
+        has_open_pos  = gate_shadow.has_open,
+        atr5          = momentum_engine.state.atr5,
+    ):
+        return
+    entry_mid = quote.mid
+    qty       = risk_manager.size_trade(entry_mid)
+    gate_shadow.enter(symbol, side, strike, qty, entry_mid,
+                      bot_state.spy_price, momentum_engine.state.atr5)
+
+
 async def _evaluate_entry(symbol: str):
     async with _entry_lock:
         if bot_state.position is not None:
             return
         if not risk_manager.can_trade():
+            # If a profit-target / win-streak GATE locked us, keep evaluating what
+            # the bot WOULD have done, observe-only, so we can log how the day
+            # would have ended if we hadn't stopped. Never places an order.
+            if risk_manager.locked and risk_manager.lock_reason in ("profit target", "win streak"):
+                try:
+                    _shadow_gate_entry(symbol)
+                except Exception as e:
+                    logger.error("gate_shadow entry eval failed (ignored): %s", e)
             return
 
         side, strike = _current_subscriptions.get(symbol, (None, None))
@@ -282,12 +373,41 @@ async def _evaluate_entry(symbol: str):
         logger.info("Placing entry: %s qty=%d limit=%.2f", symbol, qty, limit_price)
 
         # Set entry_pending before the async buy so any concurrent quote ticks
-        # (including CancelledError scenarios) see a buy is already in-flight.
+        # see a buy is already in-flight. _entry_latched_at stays None during a
+        # normal buy so the anti-wedge auto-release never disturbs it.
+        global _entry_latched_at
+        _entry_latched_at = None
         bot_state.entry_pending = True
         try:
             order = await order_manager.buy_limit(symbol, qty, limit_price)
-        finally:
-            bot_state.entry_pending = False
+        except (asyncio.CancelledError, Exception) as e:
+            # FIX #2 (WIDENED, LIVE). The buy was interrupted — by asyncio
+            # CancelledError OR by a generic Exception (the "handler error:
+            # CANCELLED" pathway that feeds.py swallows). The order may still be
+            # LIVE at Alpaca. The OLD code cleared entry_pending unconditionally,
+            # so the next quote tick fired a DUPLICATE entry — which on 08/28
+            # cascaded into a 15-lot phantom. Instead: LATCH entry_pending (leave
+            # it True) to block the next tick, and cancel any live order to head
+            # off a late fill. on_option_quote auto-releases the latch after a
+            # bounded window; a fill that still slips through is caught by the
+            # ghost sweeper. Re-raise a genuine CancelledError to preserve
+            # cancellation; swallow a generic Exception (return) since feeds.py
+            # would only log it.
+            _entry_latched_at = asyncio.get_event_loop().time()
+            logger.warning(
+                "FIX2: buy interrupted for %s (%s: %r) — entry_pending LATCHED, "
+                "cancelling live orders to prevent duplicate/ghost",
+                symbol, type(e).__name__, str(e))
+            try:
+                order_manager.cancel_all_options()
+            except Exception as ce:
+                logger.error("FIX2: cancel_all_options failed: %s", ce)
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            return
+
+        # Normal completion — clear the in-flight flag before processing the fill.
+        bot_state.entry_pending = False
 
         if order is None:
             logger.warning("Entry failed/timed out for %s — cancelling all option orders",
@@ -313,6 +433,11 @@ async def _evaluate_entry(symbol: str):
             entry_atr5       = momentum_engine.state.atr5,
         )
         bot_state.open_position(pos)
+        # Exit-parameter shadow twins — observe-only, must never break entry
+        try:
+            exit_shadow.on_entry(pos)
+        except Exception as e:
+            logger.error("exit_shadow.on_entry failed (ignored): %s", e)
         logger.info(
             "ENTERED: %s at %.2f × %d | TP=%.2f | Stop=%.2f",
             symbol, fill_price, qty,
@@ -392,6 +517,46 @@ def _print_trades():
         print("  " + "-" * 82)
         print(f"  {'TOTAL':>65}  ${total:>+7.2f}")
     print("─" * 86 + "\n")
+
+
+def _print_options():
+    """Print the entry-eligible option window (routing table) with live quotes.
+    Read-only — runs on the keyboard thread, so it only snapshots shared dicts."""
+    routing = dict(_current_subscriptions)
+    quotes  = dict(bot_state.option_quotes)
+    pos     = bot_state.position
+    held    = pos.symbol if pos else None
+    now     = datetime.datetime.now(datetime.timezone.utc)
+
+    def _age(ts) -> str:
+        try:
+            secs = int((now - ts).total_seconds())
+            return f"{secs}s" if secs < 120 else f"{secs // 60}m"
+        except Exception:
+            return "--"
+
+    print("\n" + "─" * 72)
+    print(f"  WATCHED OPTIONS  —  {len(routing)} entry-eligible  |  "
+          f"{len(quotes)} receiving quotes  |  SPY={bot_state.spy_price:.2f}")
+    print("─" * 72)
+    if not routing:
+        print("  Option window not set yet (subscribes on the first 09:30 ET bar).")
+    else:
+        print(f"  {'Symbol':<22}  {'Side':<4}  {'Strike':>7}  "
+              f"{'Bid':>6}  {'Ask':>6}  {'Mid':>6}  {'Age':>5}")
+        print("  " + "-" * 68)
+        rows = sorted(routing.items(), key=lambda kv: (kv[1][0], kv[1][1]))
+        for sym, (side, strike) in rows:
+            q = quotes.get(sym)
+            tag = "  ← HELD" if sym == held else ""
+            if q is None:
+                print(f"  {sym:<22}  {side:<4}  {strike:>7.2f}  {'no quote yet':>27}{tag}")
+            else:
+                print(f"  {sym:<22}  {side:<4}  {strike:>7.2f}  "
+                      f"{q.bid:>6.2f}  {q.ask:>6.2f}  {q.mid:>6.2f}  {_age(q.timestamp):>5}{tag}")
+    if held and held not in routing:
+        print(f"  Held {held} is outside the window (pinned for exit quotes only).")
+    print("─" * 72 + "\n")
 
 
 # ── Daily P&L recovery from CSV ──────────────────────────────────────────────
@@ -896,6 +1061,17 @@ async def _time_stop_watcher(feed: FeedManager):
         now_et = datetime.datetime.now(tz=config.ET).strftime("%H:%M")
         if now_et >= config.TIME_STOP:
             logger.info("TIME STOP reached (%s). Closing all positions.", config.TIME_STOP)
+            # Settle any still-open shadow twins at the last known mid
+            try:
+                exit_shadow.close_all("time_stop")
+            except Exception as e:
+                logger.error("exit_shadow.close_all failed (ignored): %s", e)
+            # Gate-continuation counterfactual: how the day would have ended if we
+            # had NOT stopped at the profit-target / win-streak gate.
+            try:
+                gate_shadow.eod_summary(risk_manager.daily_pnl)
+            except Exception as e:
+                logger.error("gate_shadow.eod_summary failed (ignored): %s", e)
             await _force_close_all()
             await _confirm_flat_and_exit()
             return   # unreachable — _confirm_flat_and_exit calls os._exit
@@ -972,6 +1148,7 @@ async def main():
 
     _market_open_event = asyncio.Event()
     risk_manager.reset_day()
+    gate_shadow.reset_day()
     _restore_daily_pnl()   # replay today's closed trades after a restart
 
     stock_client = StockHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_API_SECRET)
@@ -1065,7 +1242,7 @@ async def main():
         loop.add_signal_handler(sig, _signal_shutdown)
 
     def _keyboard_watcher():
-        print("  >> Bot running.  q = quit  |  r = restart (keeps positions)  |  t = trades")
+        print("  >> Bot running.  q = quit  |  r = restart (keeps positions)  |  t = trades  |  o = options")
         while not _shutdown_event.is_set():
             try:
                 # Poll stdin with 1s timeout — never blocks indefinitely
@@ -1093,6 +1270,11 @@ async def main():
                         os.execl(sys.executable, sys.executable, *sys.argv)
                     elif line == "t":
                         _print_trades()
+                    elif line == "o":
+                        try:
+                            _print_options()
+                        except Exception as e:
+                            print(f"  Error printing options: {e}")
             except Exception:
                 break
 
