@@ -712,8 +712,13 @@ def build(days: int, out_path: str):
     </div>
   </div>
 
-  <div class="text-muted pb-4" style="font-size:0.7rem;">Paper trading on Alpaca.
+  <div class="text-muted pb-2" style="font-size:0.7rem;">Paper trading on Alpaca.
     Ghost events = duplicate fills recovered by the sweeper; included in actual P&L.</div>
+  <div class="pb-4" style="font-size:0.72rem;color:#94a3b8;max-width:900px;">
+    <strong>Disclaimer:</strong> Results are paper trading (simulated fills, no real money) and may
+    differ materially from live trading. Past performance does not guarantee future results.
+    0DTE options carry a high risk of total loss. This is a personal project for educational
+    purposes, not financial or investment advice.</div>
 </div>
 
 <script>

@@ -292,7 +292,12 @@ Issues and PRs welcome. If you've found additional Alpaca API quirks not documen
 
 ## Disclaimer
 
-This software is for educational purposes only. It does not constitute financial advice. Paper trading performance does not guarantee live trading results. Use at your own risk.
+- **Educational purposes only.** This is a personal project. Nothing here is financial or investment advice, and the author is not a licensed financial advisor.
+- **Paper results are not live results.** All published results (README, strategy manual, dashboard) come from Alpaca **paper trading**, with simulated fills and no real money. Live trading can differ materially: slippage, partial fills, liquidity, and order rejections.
+- **Past performance does not guarantee future results.** Paper or live, a profitable stretch says nothing certain about the next one.
+- **0DTE options are high risk.** They can lose 100% of the premium within minutes.
+- **No warranty, no liability.** The software is provided "as is" (see [LICENSE](./LICENSE)). The author accepts no liability for any losses or damages from using it. You are solely responsible for any orders it places on your account.
+- **Test on paper first.** Run it on a paper account, and read the code, before you ever point it at real money.
 
 ---
 
