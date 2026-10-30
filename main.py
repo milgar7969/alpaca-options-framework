@@ -1055,12 +1055,31 @@ def _print_status():
 
 # ── Time stop ─────────────────────────────────────────────────────────────────
 
+def _done_for_day() -> bool:
+    """Past the entry cutoff with nothing left to manage: no real position, no
+    order in flight, and no open shadow twin. Nothing after this point can
+    trade or change the day's numbers, so the bot can end the session early."""
+    try:
+        return (bot_state.position is None
+                and not bot_state.entry_pending
+                and not bot_state.exit_pending
+                and not exit_shadow.has_open
+                and not gate_shadow.has_open)
+    except Exception:
+        return False   # any doubt → keep running until TIME_STOP
+
+
 async def _time_stop_watcher(feed: FeedManager):
     while True:
         await asyncio.sleep(10)
         now_et = datetime.datetime.now(tz=config.ET).strftime("%H:%M")
-        if now_et >= config.TIME_STOP:
-            logger.info("TIME STOP reached (%s). Closing all positions.", config.TIME_STOP)
+        early = config.ENTRY_END < now_et < config.TIME_STOP and _done_for_day()
+        if early or now_et >= config.TIME_STOP:
+            if early:
+                logger.info("Past entry cutoff (%s) and flat with no open shadow twins — "
+                            "ending session early.", config.ENTRY_END)
+            else:
+                logger.info("TIME STOP reached (%s). Closing all positions.", config.TIME_STOP)
             # Settle any still-open shadow twins at the last known mid
             try:
                 exit_shadow.close_all("time_stop")

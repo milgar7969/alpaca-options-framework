@@ -14,8 +14,8 @@ UNDERLYING        = "SPY"
 ATR_MULT          = 0.60   # how far OTM to target (calibrate after backtesting)
 MAX_STRIKE_OFFSET = 4.50   # hard cap on strike distance — prevents elevated 5-day ATR from
                             # placing strikes so far OTM that SPY never reaches the approach zone
-STRIKE_STEP       = 0.50   # SPY strikes are in $0.50 increments
-STRIKE_ALTS       = 10     # extra strikes above/below — wide window, never resubscribe
+STRIKE_STEP       = 1.00   # SPY strikes are in $0.50 increments
+STRIKE_ALTS       = 5      # extra strikes above/below — wide window, never resubscribe
 
 # ── Entry filters ──────────────────────────────────────────────────────────────
 ENTRY_START       = "09:45"  # ET — ignore signals before this

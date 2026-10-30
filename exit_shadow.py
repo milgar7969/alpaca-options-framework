@@ -171,6 +171,10 @@ class ExitShadow:
             t.on_spy_bar(spy_close)
         self._reap(datetime.datetime.now(tz=config.ET))
 
+    @property
+    def has_open(self) -> bool:
+        return any(not t.closed for t in self._twins)
+
     def close_all(self, reason: str = "time_stop"):
         """Force-settle every open twin (called at the 15:25 time stop)."""
         for t in self._twins:

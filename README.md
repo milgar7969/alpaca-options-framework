@@ -58,7 +58,7 @@ asyncio.gather(
     _option_subscriber(),       # waits for 9:30 ET bar → subscribes strikes
     _resubscribe_watcher(),     # re-subscribes if SPY moves ±$3
     _exit_monitor(),            # 30-second safety net (WebSocket reconnect gaps)
-    _time_stop_watcher(),       # 3:25 PM ET: close all → verify flat → clean exit
+    _time_stop_watcher(),       # after noon once flat, or 3:25 PM ET: close all → verify flat → clean exit
     _status_loop(),             # live terminal display
 )
 
@@ -141,7 +141,7 @@ Return `True` to trigger a limit buy. The framework handles sizing, order submis
 python main.py
 ```
 
-The bot waits for 9:30 ET, subscribes options at the actual open price, and takes new entries from 9:45 ET until noon (`ENTRY_END = "12:00"`; afternoons bled on paper, so the window was cut from 14:30). Open positions keep managing their exits after noon. Force-closes all positions at 3:25 PM ET.
+The bot waits for 9:30 ET, subscribes options at the actual open price, and takes new entries from 9:45 ET until noon (`ENTRY_END = "12:00"`; afternoons bled on paper, so the window was cut from 14:30). Open positions keep managing their exits after noon. Once the bot is past the cutoff **and** fully done (no position, no order in flight, no open shadow twin), it runs the end-of-day routine and exits early, because nothing after that point can trade. Otherwise it force-closes all positions at 3:25 PM ET.
 
 **Terminal controls:**
 - `q + Enter` — quit cleanly (closes all positions)
